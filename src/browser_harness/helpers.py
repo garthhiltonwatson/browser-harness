@@ -3,7 +3,7 @@
 Core helpers live here. Agent-editable helpers live in
 BH_AGENT_WORKSPACE/agent_helpers.py.
 """
-import base64, importlib.util, json, math, os, time, urllib.request
+import base64, importlib.util, json, math, os, sys, time, urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -69,12 +69,215 @@ def _send(req, response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
     return r
 
 
+# --- tab guard (opt-in via BH_TAB_GUARD=1) ---------------------------------
+# The daemon attaches to whatever tab is FOCUSED, and that focus follows the
+# human. For an UNATTENDED run — a scheduled job, a cron tick, anything nobody
+# is watching — that means a navigate, a click, a screenshot or a close can land
+# on a tab the run never opened: the person's own mail, banking, work.
+#
+# Documentation alone does not hold this. A run that is told "open your own tab
+# first" still drifts, because the drift happens between calls and nothing
+# refuses the next one. With BH_TAB_GUARD=1 the run may act only on tabs it
+# created itself; anything else raises TabGuardRefused.
+#
+# Opt-in deliberately: interactive use legitimately drives a tab the human
+# already opened ("summarise the page I'm looking at"), so the guard would be
+# wrong there. Unattended runs never need it.
+#
+# ALLOWLIST, not blocklist. Naming the dangerous methods cannot work: CDP has
+# hundreds and gains more. Leaving Runtime.evaluate off such a list is enough to
+# undo the whole guard, since js("location.href=...") and js("el.click()") are
+# ordinary fallbacks when a synthetic click is blocked. So the rule is inverted:
+# on a tab the run does not own, only target ENUMERATION and CREATION are
+# allowed, and every session-scoped method is refused.
+#
+# Reading an unowned tab is refused too. list_tabs() answers "what else is
+# open?" from Target.getTargets without attaching, which is all a run needs;
+# Runtime.evaluate and Page.captureScreenshot against someone's private tab are
+# the thing being prevented.
+
+class TabGuardRefused(RuntimeError):
+    """A guarded run tried to act on a tab it did not open."""
+
+
+# Global, and safe under the guard: enumeration and creation.
+_TARGET_SAFE_METHODS = {"Target.getTargets", "Target.getTargetInfo", "Target.createTarget"}
+# Global, but act on a specific target named in the params — check THAT target.
+_TARGET_SCOPED_METHODS = {
+    "Target.closeTarget", "Target.activateTarget", "Target.attachToTarget",
+    "Target.detachFromTarget", "Target.exposeDevToolsProtocol",
+}
+# Everything else is session-scoped: it acts on whatever target the daemon is
+# attached to, which is precisely what drifts.
+
+
+def _tab_guard_on():
+    return os.environ.get("BH_TAB_GUARD") == "1"
+
+
+def _run_id():
+    """Identifies one run. Set BH_TAB_GUARD_RUN to something unique per run (a
+    job id): ownership is scoped to it, so a run starts owning nothing and two
+    concurrent runs cannot consume each other's list."""
+    return os.environ.get("BH_TAB_GUARD_RUN", "")
+
+
+def _owned_path():
+    # The run id is part of the FILENAME, not just the contents. Two harness
+    # users sharing a daemon name (the default is literally "default") would
+    # otherwise read-modify-write one file and drop each other's entries —
+    # which refuses a run on its OWN tab, mid-task.
+    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in _run_id())[:64]
+    return ipc._TMP / f"{ipc._tmp_stem(NAME)}-owned-tabs-{slug or 'norun'}.json"
+
+
+def _owned_state():
+    try:
+        state = json.loads(_owned_path().read_text())
+    except Exception:
+        return {"tabs": [], "sessions": []}
+    if not isinstance(state, dict):
+        return {"tabs": [], "sessions": []}
+    return {
+        "tabs": state.get("tabs") if isinstance(state.get("tabs"), list) else [],
+        "sessions": state.get("sessions") if isinstance(state.get("sessions"), list) else [],
+    }
+
+
+def _owned_ids():
+    """Target ids of tabs this run opened."""
+    return set(_owned_state()["tabs"])
+
+
+def _owned_sessions():
+    """Session ids this run attached, so an explicitly-addressed session can be
+    told apart from someone else's."""
+    return set(_owned_state()["sessions"])
+
+
+def _remember(kind, value):
+    if not value:
+        return
+    state = _owned_state()
+    if value in state[kind]:
+        return
+    state[kind] = sorted(set(state[kind]) | {value})
+    try:
+        _owned_path().write_text(json.dumps(state))
+    except Exception as e:
+        # NOT silent. With the guard on, a lost ownership record refuses every
+        # later action on a tab the run genuinely opened, and swallowing this
+        # would make a disk problem look like a guard bug.
+        print(f"[tab-guard] WARNING could not record ownership of {value}: {e}", file=sys.stderr, flush=True)
+
+
+def _own_tab(target_id):
+    """Record a tab this run created. Runs whether the guard is on or off, so
+    enabling it part-way through cannot strand tabs the run legitimately owns."""
+    _remember("tabs", target_id)
+
+
+def tab_guard_reset():
+    """Forget every owned tab and session. Rarely needed: a run with its own
+    BH_TAB_GUARD_RUN already starts owning nothing. Calling it mid-run makes the
+    run disown its own tabs and be refused on them."""
+    try:
+        _owned_path().unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _current_target():
+    """The target the daemon is attached to, or None when it cannot be read."""
+    try:
+        return _send({"meta": "current_tab"}).get("targetId")
+    except Exception:
+        return None
+
+
+def _is_page_target(target_id):
+    """True when the target is a top-level tab, False for a subframe/worker, and
+    True when it cannot be determined — unknown must not mean permitted."""
+    try:
+        info = _send({"method": "Target.getTargetInfo", "params": {"targetId": target_id}, "session_id": None})
+        return (info.get("result", {}).get("targetInfo", {}) or {}).get("type", "page") == "page"
+    except Exception:
+        return True
+
+
+def _refuse(method, target_id, url, reason):
+    line = f"[tab-guard] REFUSED {method} {target_id or '?'} {url or ''}".rstrip()
+    print(line, file=sys.stderr, flush=True)
+    # A supervisor that wants to count refusals usually cannot see this
+    # process's stderr — it is a child of a child, and its output is captured by
+    # whatever spawned it. BH_TAB_GUARD_LOG appends the line to a file the
+    # supervisor does read.
+    log_path = os.environ.get("BH_TAB_GUARD_LOG")
+    if log_path:
+        try:
+            with open(log_path, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass  # the stderr line and the raise still stand
+    raise TabGuardRefused(f"{line} ({reason})")
+
+
+def _tab_guard_check(method, params, session_id=None):
+    if not _tab_guard_on():
+        return
+    if method in _TARGET_SAFE_METHODS:
+        return
+
+    if method in _TARGET_SCOPED_METHODS:
+        target_id = params.get("targetId")
+        if target_id in _owned_ids():
+            return
+        # A subframe or worker is reached only through a page the run already
+        # holds, so it is not a separate tab to protect. The unit of ownership
+        # here is the TAB.
+        if target_id and not _is_page_target(target_id):
+            return
+        _refuse(method, target_id, params.get("url", ""), "not a tab this run opened")
+
+    if session_id is not None:
+        # An explicitly-addressed session: allowed only if this run attached it.
+        # Validating the daemon's CURRENT target instead would check one target
+        # and then dispatch into another.
+        if session_id in _owned_sessions():
+            return
+        _refuse(method, f"session:{session_id}", params.get("url", ""), "session was not attached by this run")
+
+    # Session-scoped: acts on whatever the daemon is attached to.
+    target_id = _current_target()
+    if target_id is not None and target_id in _owned_ids():
+        return
+    # Fail CLOSED. An unreadable current target is not permission to act on it;
+    # treating "unknown" as "nothing to refuse" turns any daemon hiccup into a
+    # bypass.
+    url = params.get("url") or ""
+    reason = "not a tab this run opened" if target_id else "could not resolve the attached tab (failing closed)"
+    _refuse(method, target_id, url, reason)
+
+
 def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS, **params):
-    """Raw CDP. cdp('Page.navigate', url='...'), cdp('DOM.getDocument', depth=-1)."""
-    return _send(
+    """Raw CDP. cdp('Page.navigate', url='...'), cdp('DOM.getDocument', depth=-1).
+
+    Under BH_TAB_GUARD=1, a call against a tab this run did not open raises
+    TabGuardRefused — see the tab guard block above."""
+    _tab_guard_check(method, params, session_id)
+    result = _send(
         {"method": method, "params": params, "session_id": session_id},
         response_timeout=_response_timeout,
     ).get("result", {})
+    # Ownership is recorded at the protocol chokepoint, not in new_tab(), so a
+    # caller reaching for raw CDP is covered too.
+    if method == "Target.createTarget":
+        _own_tab(result.get("targetId"))
+    elif method == "Target.attachToTarget":
+        _remember("sessions", result.get("sessionId"))
+    return result
 
 
 def drain_events():  return _send({"meta": "drain_events"})["events"]
@@ -426,11 +629,28 @@ def switch_tab(target, activate=False):
     _mark_tab()
     return sid
 
+def _may_reuse_attached_tab():
+    """Whether new_tab() may navigate the already-attached tab instead of
+    creating one.
+
+    Under the tab guard, only when this run opened that tab: a blank tab is
+    still SOMEONE'S tab, and reusing it is the drift the guard exists to stop.
+    Unreadable attached tab -> do not reuse, which just means creating a fresh
+    tab, so failing closed here costs nothing.
+    """
+    if not _tab_guard_on():
+        return True
+    try:
+        return current_tab().get("targetId") in _owned_ids()
+    except Exception:
+        return False
+
+
 def new_tab(url="about:blank"):
     # Always create blank, then goto: passing url to createTarget races with
     # attach, so the brief about:blank is "complete" by the time the caller
     # polls and wait_for_load() returns before navigation actually starts.
-    if url != "about:blank":
+    if url != "about:blank" and _may_reuse_attached_tab():
         try:
             cur = current_tab()
             cur_url = cur.get("url") or ""
