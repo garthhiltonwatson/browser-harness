@@ -48,6 +48,20 @@ PY
   another Allow prompt.
 - Set `BH_TAB_MARKER=0` before starting the daemon to leave page titles unchanged.
   The horse marker remains enabled by default.
+- Set `BH_TAB_GUARD=1` for an **unattended** run (a scheduled job, a cron tick,
+  anything nobody is watching). The run may then act only on tabs it opened
+  itself: on any other tab the sole permitted operations are enumeration
+  (`Target.getTargets`, so `list_tabs()` still works) and creation (`new_tab()`).
+  Every session-scoped call there is refused, `js()` and screenshots included,
+  and so is a session this run did not attach; a refusal raises
+  `TabGuardRefused` and prints `[tab-guard] REFUSED <method> <targetId> <url>`.
+  It fails closed — if the attached tab cannot be read, the call is refused.
+  Leave it unset for interactive work, where driving a tab the human already
+  opened is the point.
+  Also set `BH_TAB_GUARD_RUN` to something unique per run (a job id): ownership
+  is scoped to it, so a run starts owning nothing and two concurrent runs cannot
+  consume each other's list. Set `BH_TAB_GUARD_LOG` to a file path when the
+  supervisor cannot see this process's stderr and still needs to count refusals.
 - A timeout or page that pauses while hidden is not permission to foreground
   Chrome. Keep using background CDP operations. For a focus-gated page,
   temporarily call `cdp("Emulation.setFocusEmulationEnabled", enabled=True)`,
