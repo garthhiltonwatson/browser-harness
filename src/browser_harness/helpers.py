@@ -155,20 +155,59 @@ def _owned_sessions():
     return set(_owned_state()["sessions"])
 
 
+def _owned_lock_path():
+    return _owned_path().with_suffix(".lock")
+
+
 def _remember(kind, value):
     if not value:
         return
-    state = _owned_state()
-    if value in state[kind]:
-        return
-    state[kind] = sorted(set(state[kind]) | {value})
+    # flock (POSIX) / msvcrt (Windows) around the read-modify-write: two
+    # invocations sharing one BH_TAB_GUARD_RUN (a session and its own
+    # subagent, say) can otherwise both read the same stale state and each
+    # write their own single addition, with the second write silently
+    # dropping the first's — stranding a tab this run genuinely opened.
+    lock_path = _owned_lock_path()
     try:
-        _owned_path().write_text(json.dumps(state))
+        lock_path.touch(exist_ok=True)
     except Exception as e:
-        # NOT silent. With the guard on, a lost ownership record refuses every
-        # later action on a tab the run genuinely opened, and swallowing this
-        # would make a disk problem look like a guard bug.
-        print(f"[tab-guard] WARNING could not record ownership of {value}: {e}", file=sys.stderr, flush=True)
+        print(f"[tab-guard] WARNING could not create lock for {value}: {e}", file=sys.stderr, flush=True)
+        lock_path = None
+    lock_fh = open(lock_path, "r+b") if lock_path else None
+    try:
+        if lock_fh is not None:
+            if ipc.IS_WINDOWS:
+                import msvcrt
+                if lock_fh.read() == b"":
+                    lock_fh.seek(0); lock_fh.write(b"0"); lock_fh.flush()
+                lock_fh.seek(0)
+                msvcrt.locking(lock_fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        state = _owned_state()
+        if value in state[kind]:
+            return
+        state[kind] = sorted(set(state[kind]) | {value})
+        try:
+            _owned_path().write_text(json.dumps(state))
+        except Exception as e:
+            # NOT silent. With the guard on, a lost ownership record refuses
+            # every later action on a tab the run genuinely opened, and
+            # swallowing this would make a disk problem look like a guard bug.
+            print(f"[tab-guard] WARNING could not record ownership of {value}: {e}", file=sys.stderr, flush=True)
+    finally:
+        if lock_fh is not None:
+            try:
+                if ipc.IS_WINDOWS:
+                    import msvcrt
+                    lock_fh.seek(0)
+                    msvcrt.locking(lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_fh.close()
 
 
 def _own_tab(target_id):
@@ -235,9 +274,15 @@ def _tab_guard_check(method, params, session_id=None):
         if target_id in _owned_ids():
             return
         # A subframe or worker is reached only through a page the run already
-        # holds, so it is not a separate tab to protect. The unit of ownership
-        # here is the TAB.
-        if target_id and not _is_page_target(target_id):
+        # holds, so it is not a separate tab to protect — the unit of
+        # ownership here is the TAB. But CDP's Target domain exposes no
+        # parent-tab link for an iframe target, so this cannot verify the
+        # iframe actually belongs to an OWNED tab; it can only require that
+        # the run is not acting from a completely unattached/foreign context.
+        # Enumerating a foreign tab's iframe by url substring and reaching it
+        # while attached to one's own tab is not covered by this check.
+        current = _current_target()
+        if target_id and current in _owned_ids() and not _is_page_target(target_id):
             return
         _refuse(method, target_id, params.get("url", ""), "not a tab this run opened")
 

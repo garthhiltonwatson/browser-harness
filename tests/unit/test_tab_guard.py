@@ -116,12 +116,29 @@ def test_allows_enumerating_tabs_without_attaching(guard):
     helpers.cdp("Target.getTargetInfo", targetId="FOREIGN")
 
 
-def test_allows_attaching_to_a_subframe_of_a_page_the_run_holds(guard, monkeypatch):
+def test_allows_attaching_to_a_subframe_while_attached_to_a_tab_the_run_holds(owning, monkeypatch):
     """js(target_id=...) reaches an out-of-process iframe, whose target id is
     only discoverable through a page the run already has. The unit of ownership
-    is the TAB, so a subframe is not a separate thing to protect."""
-    monkeypatch.setattr(helpers, "_send", _fake_send(target_type="iframe"))
+    is the TAB, so a subframe is not a separate thing to protect — but only
+    while the daemon is actually attached to an owned tab (see the refusal
+    test below for why)."""
+    monkeypatch.setattr(helpers, "_send", _fake_send(
+        current={"targetId": "MINE", "url": "https://example.com/", "title": "t"},
+        target_type="iframe",
+    ))
     helpers.cdp("Target.attachToTarget", targetId="SOME-IFRAME", flatten=True)
+
+
+def test_refuses_a_foreign_iframe_reached_while_attached_to_a_foreign_tab(guard, monkeypatch):
+    """CDP's Target domain exposes no parent-tab link for an iframe target, so
+    the guard cannot verify a given iframe id belongs to an OWNED tab — it can
+    only refuse to treat "not a page target" as blanket permission while the
+    run is attached to a tab it does not own. Without this, discovering a
+    foreign tab's iframe (e.g. via iframe_target(url_substr), which scans ALL
+    targets) and attaching to it would bypass the guard entirely."""
+    monkeypatch.setattr(helpers, "_send", _fake_send(target_type="iframe"))
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Target.attachToTarget", targetId="SOME-FOREIGN-IFRAME", flatten=True)
 
 
 def test_allows_a_session_this_run_attached_and_refuses_one_it_did_not(owning):
@@ -188,6 +205,22 @@ def test_ownership_crosses_a_process_boundary(guard, tmp_path):
     out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout) == ["MINE"]
+
+
+def test_concurrent_own_tab_calls_do_not_drop_each_others_entries(guard):
+    """Two invocations sharing one BH_TAB_GUARD_RUN (a session and its own
+    subagent) can call _own_tab() around the same time. Without the lock
+    around _remember()'s read-modify-write, a race here drops whichever
+    write lost — stranding a tab the run genuinely opened."""
+    import threading
+
+    ids = [f"T{i}" for i in range(20)]
+    threads = [threading.Thread(target=helpers._own_tab, args=(tid,)) for tid in ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert helpers._owned_ids() == set(ids)
 
 
 def test_a_failed_ownership_write_is_reported_not_swallowed(guard, monkeypatch, capsys):
