@@ -31,6 +31,7 @@ from .admin import (
 )
 from . import auth, recorder, telemetry
 from .helpers import *
+from . import lease as _lease
 
 HELP = """Browser Harness
 
@@ -67,6 +68,14 @@ Commands:
   browser-harness telemetry status    show anonymous telemetry opt-out state
   browser-harness --update [-y]    pull the latest version (agents: pass -y)
   browser-harness --reload         stop the daemon so next call picks up code changes
+  browser-harness --release        release your held lease on this daemon (BU_NAME)
+  browser-harness --lease-status   print who currently holds the lease, if anyone
+
+Exclusive lease: every invocation acquires/renews a per-BU_NAME lease before
+running your script, so two holders never drive the same daemon at once. A
+lone user never waits. Set BH_HOLDER to identify yourself explicitly (default:
+your Claude Code session id, or your process's session leader). Losing a
+contention wait exits with code 75. See SKILL.md.
 """
 
 USAGE = """Usage:
@@ -371,6 +380,20 @@ def _run(args):
         restart_daemon()
         print("daemon stopped — will restart fresh on next call")
         return
+    if args and args[0] == "--release":
+        released = _lease.release(NAME)
+        print(f"released lease on {NAME!r}" if released else f"no lease held on {NAME!r} — nothing to release")
+        return
+    if args and args[0] == "--lease-status":
+        record = _lease.status(NAME)
+        if not record:
+            print(f"{NAME!r}: no lease held")
+        else:
+            print(
+                f"{NAME!r}: held by {record.get('holder')} (pid {record.get('pid')} on {record.get('host')}), "
+                f"acquired {_lease._fmt(record.get('acquired_at'))}, expires {_lease._fmt(record.get('expires_at'))}"
+            )
+        return
     if args and args[0] == "--debug-clicks":
         os.environ["BH_DEBUG_CLICKS"] = "1"
         args = args[1:]
@@ -381,6 +404,23 @@ def _run(args):
     else:
         sys.exit(USAGE)
     print_update_banner()
+    try:
+        _lease.acquire(
+            NAME,
+            on_wait=lambda rec: print(
+                f"[lease] waiting for {rec.get('holder')} to free {NAME!r} "
+                f"(held since {_lease._fmt(rec.get('acquired_at'))})...",
+                file=sys.stderr, flush=True,
+            ),
+            on_takeover=lambda rec: print(
+                f"[lease] took over {NAME!r} from {rec.get('holder')} "
+                f"(expired {_lease._fmt(rec.get('expires_at'))} or its process is dead)",
+                file=sys.stderr, flush=True,
+            ),
+        )
+    except _lease.LeaseBusy as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(_lease.EXIT_BUSY)
     # Auto-bootstrap a cloud browser is opt-in via BU_AUTOSPAWN — BROWSER_USE_API_KEY alone
     # is not enough, since the key is commonly set for unrelated reasons (profile sync,
     # cloud API calls, parent agents managing their own session). An explicit BU_CDP_URL

@@ -70,6 +70,7 @@ PY
   activating the tab. Do not invent a `Runtime.evaluate` scroll replacement or
   a cross-frame JS walker.
 - The normal local flow attaches to the running Chrome/Chromium CDP endpoint. No browser ids or local profile selection.
+- **Exclusive lease (always on):** every invocation acquires or renews a per-`BU_NAME` lease before running your script, so two holders can never drive the same daemon at the same time (this is what the tab guard above cannot stop — two runs interleaving on the SAME attached tab, not one run wandering onto a foreign one). A lone user never waits. Holder identity is `BH_HOLDER` if you set it, else your Claude Code session id, else your process's session leader — a child agent shares its parent session's lease unless it sets its own `BH_HOLDER`. Losing a contention wait (default up to `BH_LEASE_WAIT=120` seconds) exits **75** with `browser busy: held by <holder> since <time>, expires <time>` on stderr; renewal TTL defaults to `BH_LEASE_TTL=600` seconds. Run `browser-harness --lease-status` to see who holds it, and `browser-harness --release` to give up your own turn. **Unattended loops must set `BH_HOLDER=<loop-name>` and call `browser-harness --release` when done**, so they don't sit on the lease between ticks.
 
 ## Local Chrome
 
