@@ -109,6 +109,30 @@ def _delete(name):
         pass
 
 
+def _pid_alive(pid):
+    """Liveness probe only — never delivers a real signal. os.kill(pid, 0) is
+    POSIX-only for this purpose: on Windows, signal 0 aliases CTRL_C_EVENT, so
+    os.kill(pid, 0) there can dispatch a console-control event to a live
+    process instead of merely probing it. Use OpenProcess there instead."""
+    if ipc.IS_WINDOWS:
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just not signalable by us
+    except Exception:
+        return True  # unknown -> assume alive, never take over on a hunch
+
+
 def _is_dead(record):
     """True iff the recorded pid is verifiably dead on THIS host. A record from
     a different host can never be proven dead here, so it is treated as alive
@@ -118,15 +142,7 @@ def _is_dead(record):
     pid = record.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         return True
-    try:
-        os.kill(pid, 0)
-        return False
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False  # exists, just not signalable by us
-    except Exception:
-        return False
+    return not _pid_alive(pid)
 
 
 class _FileLock:
