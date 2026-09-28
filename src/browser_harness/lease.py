@@ -107,7 +107,12 @@ def holder_identity():
     if sid:
         return f"claude-session:{sid}"
     try:
-        return f"pgrp:{os.getsid(0)}"
+        leader = os.getsid(0)
+        # launchd jobs run in launchd's own session (sid 1): every scheduled
+        # job would share ONE identity. Use the parent (the job's wrapper).
+        if leader > 1:
+            return f"pgrp:{leader}"
+        return f"ppid:{os.getppid()}"
     except Exception:
         return f"pid:{os.getpid()}"
 
@@ -137,7 +142,7 @@ def _owner():
             return int(v), "env"
     try:
         sid = os.getsid(0)
-        if sid > 0 and sid != os.getpid():
+        if sid > 1 and sid != os.getpid():  # sid 1 = launchd: never dies, anchors nothing
             return sid, "fallback"
     except Exception:
         pass
