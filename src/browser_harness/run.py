@@ -68,14 +68,17 @@ Commands:
   browser-harness telemetry status    show anonymous telemetry opt-out state
   browser-harness --update [-y]    pull the latest version (agents: pass -y)
   browser-harness --reload         stop the daemon so next call picks up code changes
+  browser-harness --acquire [label] hold the lease for a multi-call task; prints BH_HOLDER=<token>
   browser-harness --release        release your held lease on this daemon (BU_NAME)
   browser-harness --lease-status   print who currently holds the lease, if anyone
 
 Exclusive lease: every invocation acquires/renews a per-BU_NAME lease before
 running your script, so two holders never drive the same daemon at once. A
 lone user never waits. Set BH_HOLDER to identify yourself explicitly (default:
-your Claude Code session id, or your process's session leader). Losing a
-contention wait exits with code 75. See SKILL.md.
+your Claude Code session id, or your process's session leader). The lease
+lives while its owner process (CLAUDE_PID / session leader) lives, until no
+call renews it for BH_LEASE_TTL (explicit, 20 min) or BH_LEASE_TTL_IMPLICIT
+(5 min). Losing a contention wait exits with code 75. See SKILL.md.
 """
 
 USAGE = """Usage:
@@ -310,6 +313,22 @@ def main():
     )
 
 
+_last_wait_note = [0.0]
+
+
+def _lease_waiting(rec):
+    """Waiting message, throttled to one line per 30s (acquire polls every 2s)."""
+    if time.time() - _last_wait_note[0] < 30:
+        return
+    _last_wait_note[0] = time.time()
+    print(
+        f"[lease] waiting for {rec.get('holder')} to free {NAME!r} "
+        f"(held since {_lease._fmt(rec.get('acquired_at'))}, expires {_lease._fmt(rec.get('expires_at'))}); "
+        f"gives up with exit {_lease.EXIT_BUSY} after BH_LEASE_WAIT={_lease.DEFAULT_WAIT:g}s",
+        file=sys.stderr, flush=True,
+    )
+
+
 def _run(args):
     if args and args[0] in {"-h", "--help"}:
         print(HELP)
@@ -377,12 +396,50 @@ def _run(args):
             sys.exit(2)
         sys.exit(run_update(yes=bool(rest)))
     if args and args[0] == "--reload":
+        # Killing the shared daemon mid-task is a mutation too: take the lease
+        # first (review of PR #3).
+        try:
+            _lease.acquire(NAME, on_wait=_lease_waiting)
+        except _lease.LeaseBusy as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(_lease.EXIT_BUSY)
         restart_daemon()
         print("daemon stopped — will restart fresh on next call")
         return
+    if args and args[0] == "--acquire":
+        # Explicit, task-long hold. The holder name IS the token: every later
+        # call in the task must carry the same BH_HOLDER, or it is a
+        # different holder and waits like anyone else.
+        holder = os.environ.get("BH_HOLDER")
+        if not holder:
+            import secrets
+            label = args[1] if len(args) > 1 else "agent"
+            holder = f"{label}-{secrets.token_hex(3)}"
+        try:
+            _lease.acquire(NAME, holder=holder, on_wait=_lease_waiting)
+        except _lease.LeaseBusy as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(_lease.EXIT_BUSY)
+        print(f"BH_HOLDER={holder}")
+        owner, src = _lease._owner()
+        if src == "fallback":
+            # No CLAUDE_PID: the owner guess may be a per-call shell. Pin it.
+            print(f"BH_HOLDER_PID={owner}  # set to your long-lived process pid for dead-owner recovery",
+                  file=sys.stderr)
+        print(f"lease on {NAME!r} held — prefix EVERY browser-harness call with BH_HOLDER={holder}, "
+              f"then run `BH_HOLDER={holder} browser-harness --release`", file=sys.stderr)
+        return
     if args and args[0] == "--release":
         released = _lease.release(NAME)
-        print(f"released lease on {NAME!r}" if released else f"no lease held on {NAME!r} — nothing to release")
+        if released:
+            print(f"released lease on {NAME!r}")
+        else:
+            record = _lease.status(NAME)
+            if record:
+                print(f"lease on {NAME!r} is held by {record.get('holder')}, not by you "
+                      f"({_lease.holder_identity()}) — left in place", file=sys.stderr)
+            else:
+                print(f"no lease held on {NAME!r} — nothing to release")
         return
     if args and args[0] == "--lease-status":
         record = _lease.status(NAME)
@@ -391,7 +448,9 @@ def _run(args):
         else:
             print(
                 f"{NAME!r}: held by {record.get('holder')} (pid {record.get('pid')} on {record.get('host')}), "
-                f"acquired {_lease._fmt(record.get('acquired_at'))}, expires {_lease._fmt(record.get('expires_at'))}"
+                f"acquired {_lease._fmt(record.get('acquired_at'))}, "
+                f"last heartbeat {_lease._fmt(record.get('heartbeat_at', record.get('acquired_at')))}, "
+                f"expires {_lease._fmt(record.get('expires_at'))}"
             )
         return
     if args and args[0] == "--debug-clicks":
@@ -407,11 +466,7 @@ def _run(args):
     try:
         _lease.acquire(
             NAME,
-            on_wait=lambda rec: print(
-                f"[lease] waiting for {rec.get('holder')} to free {NAME!r} "
-                f"(held since {_lease._fmt(rec.get('acquired_at'))})...",
-                file=sys.stderr, flush=True,
-            ),
+            on_wait=_lease_waiting,
             on_takeover=lambda rec: print(
                 f"[lease] took over {NAME!r} from {rec.get('holder')} "
                 f"(expired {_lease._fmt(rec.get('expires_at'))} or its process is dead)",

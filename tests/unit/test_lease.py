@@ -78,7 +78,8 @@ def test_busy_exit_code_constant_is_75():
 # --- expiry takeover ---------------------------------------------------------
 
 def test_expired_lease_is_taken_over_without_waiting():
-    lease.acquire("t1", holder="alice", ttl=0.05, wait=0)
+    rec = lease.acquire("t1", holder="alice", ttl=0.05, wait=0)
+    lease._write("t1", {**rec, "invocation_pid": _find_dead_pid()})  # alice's call has ended
     time.sleep(0.1)
     took_over = []
     start = time.time()
@@ -164,3 +165,209 @@ def test_different_bu_names_do_not_contend():
     lease.acquire("nameA", holder="alice", ttl=60, wait=0)
     record = lease.acquire("nameB", holder="bob", ttl=60, wait=0)
     assert record["holder"] == "bob"
+
+
+# =============================================================================
+# Owner-anchored lease (2026-09-28). Two incidents: an agent's calls ran while
+# another agent was mid-publish to Substack, and an agent deleted another's
+# hand-rolled mkdir lock. Root cause in this module: the lease recorded the pid
+# of the short-lived browser-harness INVOCATION, so the moment each call
+# exited the lease read as "holder dead" and anyone took it over — the lease
+# only covered a single running call, never a multi-call task.
+# =============================================================================
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+from browser_harness import run as _run_mod
+
+SRC = str(Path(__file__).resolve().parents[2] / "src")
+
+
+def _child_env(extra=None):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("BH_HOLDER", "BH_HOLDER_PID", "CLAUDE_PID", "CLAUDE_CODE_SESSION_ID")}
+    env.update({
+        "PYTHONPATH": SRC,
+        "BH_RUNTIME_DIR": str(lease.ipc._RUNTIME),
+        "BH_RUNTIME_DIR_SHARED": "1",  # same bu-<name> stem as this process
+    })
+    env.update(extra or {})
+    return env
+
+
+def _child_acquire(holder, extra_env=None, wait=0):
+    """Acquire in a SEPARATE short-lived process, like one CLI invocation."""
+    code = (
+        "import sys\n"
+        "from browser_harness import lease\n"
+        f"try:\n    lease.acquire('t1', wait={wait})\n    print('GOT')\n"
+        "except lease.LeaseBusy:\n    print('BUSY')\n"
+    )
+    env = _child_env({"BH_HOLDER": holder, **(extra_env or {})})
+    return subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, text=True)
+
+
+def test_concurrent_acquire_exactly_one_winner():
+    procs = [_child_acquire(f"agent-{i}", {"BH_HOLDER_PID": str(os.getpid())}) for i in range(8)]
+    outs = [p.communicate(timeout=30)[0].strip() for p in procs]
+    assert outs.count("GOT") == 1, outs
+    assert outs.count("BUSY") == 7, outs
+
+
+def test_lease_outlives_the_invocation_while_the_owner_lives():
+    """The regression: invocation exits, owner (session/tick) still alive ->
+    the lease must still block everyone else."""
+    p = _child_acquire("publisher", {"BH_HOLDER_PID": str(os.getpid())})
+    assert p.communicate(timeout=30)[0].strip() == "GOT"
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="intruder", wait=0.2)
+    assert lease.status("t1")["holder"] == "publisher"
+
+
+def test_claude_pid_is_the_default_owner_anchor(monkeypatch):
+    monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+    assert lease.owner_pid() == os.getpid()
+
+
+def test_dead_owner_anchor_falls_through_to_session_leader(monkeypatch):
+    monkeypatch.setenv("CLAUDE_PID", str(_find_dead_pid()))
+    assert lease.owner_pid() != int(os.environ["CLAUDE_PID"])
+
+
+def test_reentrant_owner_across_invocations_keeps_acquired_at():
+    first = _child_acquire("publisher", {"BH_HOLDER_PID": str(os.getpid())})
+    assert first.communicate(timeout=30)[0].strip() == "GOT"
+    acquired = lease.status("t1")["acquired_at"]
+    time.sleep(0.05)
+    second = _child_acquire("publisher", {"BH_HOLDER_PID": str(os.getpid())})
+    assert second.communicate(timeout=30)[0].strip() == "GOT"
+    rec = lease.status("t1")
+    assert rec["acquired_at"] == acquired
+    assert rec["heartbeat_at"] > acquired
+
+
+def test_explicit_holder_gets_the_long_ttl_implicit_the_short(monkeypatch):
+    monkeypatch.setenv("BH_HOLDER", "publisher")
+    rec = lease.acquire("t1", wait=0)
+    assert rec["expires_at"] - rec["heartbeat_at"] == pytest.approx(lease.DEFAULT_TTL)
+    monkeypatch.delenv("BH_HOLDER")
+    rec = lease.acquire("t2", wait=0)
+    assert rec["expires_at"] - rec["heartbeat_at"] == pytest.approx(lease.IMPLICIT_TTL)
+    assert lease.DEFAULT_TTL == 1200 and lease.IMPLICIT_TTL < lease.DEFAULT_TTL
+
+
+def test_explicit_holder_blocks_its_own_sessions_implicit_calls(monkeypatch):
+    """A subagent that set BH_HOLDER is protected even from sibling agents of
+    the same Claude session (which share the implicit session identity)."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "same-session")
+    lease.acquire("t1", holder="substack-publish", wait=0)
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", wait=0.1)
+
+
+def test_stale_takeover_only_when_owner_dead_and_is_logged():
+    live = {"holder": "alice", "pid": os.getpid(), "host": lease._hostname(),
+            "acquired_at": time.time(), "heartbeat_at": time.time(), "expires_at": time.time() + 600}
+    lease._write("t1", live)
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="bob", wait=0.1)
+    lease._write("t1", {**live, "pid": _find_dead_pid()})
+    assert lease.acquire("t1", holder="bob", wait=0)["holder"] == "bob"
+    events = [json.loads(line) for line in lease._log_path("t1").read_text().splitlines()]
+    assert any(e["event"] == "takeover" and e["from"] == "alice" and e["to"] == "bob" for e in events)
+
+
+def test_busy_timeout_is_logged():
+    lease.acquire("t1", holder="alice", wait=0)
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="bob", wait=0)
+    events = [json.loads(line) for line in lease._log_path("t1").read_text().splitlines()]
+    assert any(e["event"] == "busy" and e["holder"] == "alice" and e["waiter"] == "bob" for e in events)
+
+
+def test_old_format_record_with_dead_invocation_pid_is_still_free():
+    """Rollout: a lease written by the pre-anchor code (no heartbeat_at, pid =
+    a finished invocation) must not wedge the first new-code caller."""
+    lease._write("t1", {"holder": "old", "pid": _find_dead_pid(), "host": lease._hostname(),
+                        "acquired_at": time.time(), "expires_at": time.time() + 600})
+    assert lease.acquire("t1", holder="new", wait=0)["holder"] == "new"
+
+
+# --- CLI: the gate is enforced, not advisory ------------------------------------
+
+def _cli(args, stdin="", extra_env=None, timeout=60):
+    env = _child_env(extra_env)
+    env["BU_NAME"] = "t1"
+    env["BH_LEASE_WAIT"] = "0.3"
+    return subprocess.run([sys.executable, "-m", "browser_harness.run", *args], input=stdin,
+                          env=env, capture_output=True, text=True, timeout=timeout)
+
+
+def test_cli_busy_exits_75_and_never_runs_the_script():
+    lease.acquire("t1", holder="publisher", owner=os.getpid(), wait=0)
+    r = _cli([], stdin="print('RAN-WITHOUT-LOCK')\n", extra_env={"BH_HOLDER": "intruder"})
+    assert r.returncode == 75
+    assert "RAN-WITHOUT-LOCK" not in r.stdout
+    assert "browser busy: held by publisher" in r.stderr
+
+
+def test_cli_acquire_prints_a_holder_token_and_holds_the_lease():
+    r = _cli(["--acquire", "substack"], extra_env={"BH_HOLDER_PID": str(os.getpid())})
+    assert r.returncode == 0, r.stderr
+    token = r.stdout.strip().splitlines()[0]
+    assert token.startswith("BH_HOLDER=substack-")
+    assert lease.status("t1")["holder"] == token.split("=", 1)[1]
+
+
+def test_cli_acquire_busy_exits_75():
+    lease.acquire("t1", holder="publisher", owner=os.getpid(), wait=0)
+    r = _cli(["--acquire"], extra_env={"BH_HOLDER": "intruder"})
+    assert r.returncode == 75
+    assert lease.status("t1")["holder"] == "publisher"
+
+
+def test_cli_release_never_deletes_a_foreign_live_lease():
+    lease.acquire("t1", holder="publisher", owner=os.getpid(), wait=0)
+    r = _cli(["--release"], extra_env={"BH_HOLDER": "intruder"})
+    assert r.returncode == 0
+    assert "held by publisher" in r.stderr and "left in place" in r.stderr
+    assert lease.status("t1")["holder"] == "publisher"
+
+
+# --- review round (PR #3) -----------------------------------------------------
+
+def test_explicit_holder_with_fallback_owner_is_not_freed_by_owner_death():
+    """A non-Claude caller (no CLAUDE_PID) whose owner guess is a per-command
+    shell: that shell dying between calls must not free a declared task."""
+    lease._write("t1", {"holder": "oc-task", "pid": _find_dead_pid(), "owner_src": "fallback",
+                        "explicit": True, "invocation_pid": _find_dead_pid(), "host": lease._hostname(),
+                        "acquired_at": time.time(), "heartbeat_at": time.time(), "expires_at": time.time() + 600})
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="intruder", wait=0.1)
+
+
+def test_implicit_fallback_owner_frees_once_owner_and_call_are_gone():
+    lease._write("t1", {"holder": "pgrp:1", "pid": _find_dead_pid(), "owner_src": "fallback",
+                        "explicit": False, "invocation_pid": _find_dead_pid(), "host": lease._hostname(),
+                        "acquired_at": time.time(), "heartbeat_at": time.time(), "expires_at": time.time() + 600})
+    assert lease.acquire("t1", holder="next", wait=0)["holder"] == "next"
+
+
+def test_expired_lease_is_not_taken_while_its_call_is_still_running():
+    """A single long call never renews its own heartbeat."""
+    lease._write("t1", {"holder": "alice", "pid": os.getpid(), "owner_src": "env", "explicit": False,
+                        "invocation_pid": os.getpid(), "host": lease._hostname(),
+                        "acquired_at": time.time() - 900, "heartbeat_at": time.time() - 900,
+                        "expires_at": time.time() - 600})
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="bob", wait=0.1)
+
+
+def test_cli_reload_respects_a_foreign_lease():
+    lease.acquire("t1", holder="publisher", owner=os.getpid(), wait=0)
+    r = _cli(["--reload"], extra_env={"BH_HOLDER": "intruder"})
+    assert r.returncode == 75
+    assert "held by publisher" in r.stderr
