@@ -36,7 +36,8 @@ are appended to <stem>.lease.log next to the lease file.
 
 Holder identity (see holder_identity()): BH_HOLDER env if the caller set it;
 else the Claude Code session id (CLAUDE_CODE_SESSION_ID) if present; else this
-process's POSIX session leader. Subagents of one Claude Code session inherit
+process's POSIX session leader — or, for a launchd job (session 1, shared by
+every job), the parent process (the job's wrapper). Subagents of one Claude Code session inherit
 their parent's CLAUDE_CODE_SESSION_ID and therefore share one lease holder —
 intentional, since they are cooperating parts of one task, not two unrelated
 users. A subagent that legitimately needs its own browser turn sets BH_HOLDER
@@ -107,7 +108,13 @@ def holder_identity():
     if sid:
         return f"claude-session:{sid}"
     try:
-        return f"pgrp:{os.getsid(0)}"
+        leader = os.getsid(0)
+        # launchd jobs run in launchd's own session (sid 1): every scheduled
+        # job would share ONE identity. Use the parent (the job's wrapper).
+        if leader > 1:
+            return f"pgrp:{leader}"
+        parent = os.getppid()
+        return f"ppid:{parent}" if parent > 1 else f"pid:{os.getpid()}"
     except Exception:
         return f"pid:{os.getpid()}"
 
@@ -137,11 +144,12 @@ def _owner():
             return int(v), "env"
     try:
         sid = os.getsid(0)
-        if sid > 0 and sid != os.getpid():
+        if sid > 1 and sid != os.getpid():  # sid 1 = launchd: never dies, anchors nothing
             return sid, "fallback"
     except Exception:
         pass
-    return os.getppid(), "fallback"
+    parent = os.getppid()
+    return (parent if parent > 1 else os.getpid()), "fallback"
 
 
 def _fmt(epoch):

@@ -75,7 +75,8 @@ Commands:
 Exclusive lease: every invocation acquires/renews a per-BU_NAME lease before
 running your script, so two holders never drive the same daemon at once. A
 lone user never waits. Set BH_HOLDER to identify yourself explicitly (default:
-your Claude Code session id, or your process's session leader). The lease
+your Claude Code session id, else your session leader, or the parent for a
+launchd job). The lease
 lives while its owner process (CLAUDE_PID / session leader) lives, until no
 call renews it for BH_LEASE_TTL (explicit, 20 min) or BH_LEASE_TTL_IMPLICIT
 (5 min). Losing a contention wait exits with code 75. See SKILL.md.
