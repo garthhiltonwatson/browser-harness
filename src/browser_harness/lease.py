@@ -117,7 +117,15 @@ def is_explicit():
 
 
 def owner_pid():
-    """The long-lived process whose life bounds this holder's turn. Order:
+    return _owner()[0]
+
+
+def _owner():
+    """(pid, source). source "env" = BH_HOLDER_PID / CLAUDE_PID, a process the
+    caller vouches for; "fallback" = session leader / parent, which may be a
+    per-command shell that exits with the call (review of PR #3).
+
+    The long-lived process whose life bounds this holder's turn. Order:
     BH_HOLDER_PID, CLAUDE_PID (the Claude Code process — shared by a session
     and its subagents, and by a headless `claude -p` tick), the POSIX session
     leader, the parent. A candidate that is not alive is skipped; a session
@@ -126,14 +134,14 @@ def owner_pid():
     for var in ("BH_HOLDER_PID", "CLAUDE_PID"):
         v = os.environ.get(var, "")
         if v.isdigit() and int(v) > 0 and _pid_alive(int(v)):
-            return int(v)
+            return int(v), "env"
     try:
         sid = os.getsid(0)
         if sid > 0 and sid != os.getpid():
-            return sid
+            return sid, "fallback"
     except Exception:
         pass
-    return os.getppid()
+    return os.getppid(), "fallback"
 
 
 def _fmt(epoch):
@@ -188,15 +196,39 @@ def _pid_alive(pid):
 
 
 def _is_dead(record):
-    """True iff the recorded pid is verifiably dead on THIS host. A record from
-    a different host can never be proven dead here, so it is treated as alive
-    (only its expiry can take it over)."""
+    """True iff the holder is verifiably gone on THIS host. A record from a
+    different host can never be proven dead here, so it is treated as alive
+    (only its expiry can take it over).
+
+    A fallback-sourced owner (session leader / parent) may be a per-command
+    shell that dies with every call, so for an EXPLICIT holder — one that
+    declared a multi-call task — its death proves nothing and only the TTL
+    frees the lease (set BH_HOLDER_PID to get prompt dead-owner recovery). For
+    an implicit holder it counts only once the invocation is gone too.
+    Records with no owner_src (pre-anchor format) keep the old pid check."""
     if record.get("host") != _hostname():
         return False
     pid = record.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         return True
+    if record.get("owner_src") == "fallback":
+        if record.get("explicit"):
+            return False
+        return not _pid_alive(pid) and not _invocation_alive(record)
     return not _pid_alive(pid)
+
+
+def _invocation_alive(record):
+    ipid = record.get("invocation_pid")
+    return (record.get("host") == _hostname() and isinstance(ipid, int) and ipid > 0
+            and _pid_alive(ipid))
+
+
+def _expired(record, now):
+    """Heartbeat missed for a full TTL — unless the call that wrote it is
+    still running (a single long call never refreshes its own heartbeat, and
+    must not be taken over mid-script: review of PR #3)."""
+    return record.get("expires_at", 0) <= now and not _invocation_alive(record)
 
 
 class _FileLock:
@@ -246,11 +278,12 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
     `holder` passed in) and IMPLICIT_TTL otherwise. owner defaults to
     owner_pid().
     """
+    explicit = bool(holder) or is_explicit()
     if ttl is None:
-        ttl = DEFAULT_TTL if (holder or is_explicit()) else IMPLICIT_TTL
+        ttl = DEFAULT_TTL if explicit else IMPLICIT_TTL
     wait = DEFAULT_WAIT if wait is None else wait
     holder = holder or holder_identity()
-    owner = owner or owner_pid()
+    owner, owner_src = (owner, "env") if owner else _owner()
     deadline = time.time() + wait
     blocking = None
     while True:
@@ -260,7 +293,7 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
             free = (
                 record is None
                 or record.get("holder") == holder
-                or record.get("expires_at", 0) <= now
+                or _expired(record, now)
                 or _is_dead(record)
             )
             if free:
@@ -272,6 +305,8 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
                 new_record = {
                     "holder": holder,
                     "pid": owner,                    # the OWNER anchor, not this call
+                    "owner_src": owner_src,
+                    "explicit": explicit,
                     "invocation_pid": os.getpid(),
                     "host": _hostname(),
                     "acquired_at": record.get("acquired_at", now) if renewing else now,

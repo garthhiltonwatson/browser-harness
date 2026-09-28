@@ -396,6 +396,13 @@ def _run(args):
             sys.exit(2)
         sys.exit(run_update(yes=bool(rest)))
     if args and args[0] == "--reload":
+        # Killing the shared daemon mid-task is a mutation too: take the lease
+        # first (review of PR #3).
+        try:
+            _lease.acquire(NAME, on_wait=_lease_waiting)
+        except _lease.LeaseBusy as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(_lease.EXIT_BUSY)
         restart_daemon()
         print("daemon stopped — will restart fresh on next call")
         return
@@ -414,6 +421,11 @@ def _run(args):
             print(str(e), file=sys.stderr)
             sys.exit(_lease.EXIT_BUSY)
         print(f"BH_HOLDER={holder}")
+        owner, src = _lease._owner()
+        if src == "fallback":
+            # No CLAUDE_PID: the owner guess may be a per-call shell. Pin it.
+            print(f"BH_HOLDER_PID={owner}  # set to your long-lived process pid for dead-owner recovery",
+                  file=sys.stderr)
         print(f"lease on {NAME!r} held — prefix EVERY browser-harness call with BH_HOLDER={holder}, "
               f"then run `BH_HOLDER={holder} browser-harness --release`", file=sys.stderr)
         return

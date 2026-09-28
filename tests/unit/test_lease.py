@@ -78,7 +78,8 @@ def test_busy_exit_code_constant_is_75():
 # --- expiry takeover ---------------------------------------------------------
 
 def test_expired_lease_is_taken_over_without_waiting():
-    lease.acquire("t1", holder="alice", ttl=0.05, wait=0)
+    rec = lease.acquire("t1", holder="alice", ttl=0.05, wait=0)
+    lease._write("t1", {**rec, "invocation_pid": _find_dead_pid()})  # alice's call has ended
     time.sleep(0.1)
     took_over = []
     start = time.time()
@@ -334,3 +335,39 @@ def test_cli_release_never_deletes_a_foreign_live_lease():
     assert r.returncode == 0
     assert "held by publisher" in r.stderr and "left in place" in r.stderr
     assert lease.status("t1")["holder"] == "publisher"
+
+
+# --- review round (PR #3) -----------------------------------------------------
+
+def test_explicit_holder_with_fallback_owner_is_not_freed_by_owner_death():
+    """A non-Claude caller (no CLAUDE_PID) whose owner guess is a per-command
+    shell: that shell dying between calls must not free a declared task."""
+    lease._write("t1", {"holder": "oc-task", "pid": _find_dead_pid(), "owner_src": "fallback",
+                        "explicit": True, "invocation_pid": _find_dead_pid(), "host": lease._hostname(),
+                        "acquired_at": time.time(), "heartbeat_at": time.time(), "expires_at": time.time() + 600})
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="intruder", wait=0.1)
+
+
+def test_implicit_fallback_owner_frees_once_owner_and_call_are_gone():
+    lease._write("t1", {"holder": "pgrp:1", "pid": _find_dead_pid(), "owner_src": "fallback",
+                        "explicit": False, "invocation_pid": _find_dead_pid(), "host": lease._hostname(),
+                        "acquired_at": time.time(), "heartbeat_at": time.time(), "expires_at": time.time() + 600})
+    assert lease.acquire("t1", holder="next", wait=0)["holder"] == "next"
+
+
+def test_expired_lease_is_not_taken_while_its_call_is_still_running():
+    """A single long call never renews its own heartbeat."""
+    lease._write("t1", {"holder": "alice", "pid": os.getpid(), "owner_src": "env", "explicit": False,
+                        "invocation_pid": os.getpid(), "host": lease._hostname(),
+                        "acquired_at": time.time() - 900, "heartbeat_at": time.time() - 900,
+                        "expires_at": time.time() - 600})
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="bob", wait=0.1)
+
+
+def test_cli_reload_respects_a_foreign_lease():
+    lease.acquire("t1", holder="publisher", owner=os.getpid(), wait=0)
+    r = _cli(["--reload"], extra_env={"BH_HOLDER": "intruder"})
+    assert r.returncode == 75
+    assert "held by publisher" in r.stderr
