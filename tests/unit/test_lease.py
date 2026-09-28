@@ -381,3 +381,10 @@ def test_launchd_jobs_do_not_share_one_identity_or_anchor_on_launchd(monkeypatch
     monkeypatch.setattr(lease.os, "getsid", lambda _pid: 1)
     assert lease.holder_identity() == f"ppid:{os.getppid()}"
     assert lease.owner_pid() == os.getppid()
+
+
+def test_orphan_under_launchd_never_anchors_on_pid_1(monkeypatch):
+    monkeypatch.setattr(lease.os, "getsid", lambda _pid: 1)
+    monkeypatch.setattr(lease.os, "getppid", lambda: 1)
+    assert lease.holder_identity() == f"pid:{os.getpid()}"
+    assert lease.owner_pid() == os.getpid()
