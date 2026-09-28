@@ -16,8 +16,23 @@ acquires or renews the lease BEFORE running the caller's script:
   - same holder                          -> renew (extend expiry)
   - different holder, lease unexpired     -> wait (poll) up to BH_LEASE_WAIT,
                                              then raise LeaseBusy
-  - lease expired, or holder's pid is
-    dead on this host                     -> take over, log it
+  - lease expired (no heartbeat within
+    its TTL), or its OWNER pid is dead
+    on this host                          -> take over, log it
+
+Owner anchor (2026-09-28, see owner_pid()): the recorded pid is the
+long-lived process that owns the task — BH_HOLDER_PID if set, else the Claude
+Code process (CLAUDE_PID), else the POSIX session leader — NOT the
+browser-harness invocation itself. The first cut recorded the invocation's
+own pid, which is dead the moment each call returns, so every lease read as
+"holder dead" between calls and any other agent took it over: the lease only
+covered one running call, never a multi-call task such as a Substack publish
+(incident 2026-09-28). Now the lease lives as long as its owner does, until a
+heartbeat (any invocation by the same holder) is missed for a full TTL:
+BH_LEASE_TTL (20 min) for an explicit BH_HOLDER, BH_LEASE_TTL_IMPLICIT
+(5 min) for an implicit session identity, so a session that used the browser
+once does not starve a scheduled tick for long. Takeovers and busy timeouts
+are appended to <stem>.lease.log next to the lease file.
 
 Holder identity (see holder_identity()): BH_HOLDER env if the caller set it;
 else the Claude Code session id (CLAUDE_CODE_SESSION_ID) if present; else this
@@ -45,7 +60,8 @@ if ipc.IS_WINDOWS:
 else:
     import fcntl
 
-DEFAULT_TTL = float(os.environ.get("BH_LEASE_TTL", 600))    # 10 min
+DEFAULT_TTL = float(os.environ.get("BH_LEASE_TTL", 1200))                   # explicit BH_HOLDER: 20 min
+IMPLICIT_TTL = float(os.environ.get("BH_LEASE_TTL_IMPLICIT", 300))         # implicit identity: 5 min
 DEFAULT_WAIT = float(os.environ.get("BH_LEASE_WAIT", 120))  # 2 min
 POLL_INTERVAL = 2.0
 EXIT_BUSY = 75
@@ -61,6 +77,20 @@ def _lease_path(name):
 
 def _lock_path(name):
     return ipc._RUNTIME / f"{ipc._runtime_stem(name)}.lease.lock"
+
+
+def _log_path(name):
+    return ipc._RUNTIME / f"{ipc._runtime_stem(name)}.lease.log"
+
+
+def _log(name, event, **fields):
+    """Append one audit line (takeover / busy). Never raises — the log is
+    evidence, not a gate."""
+    try:
+        with open(_log_path(name), "a") as fh:
+            fh.write(json.dumps({"ts": time.time(), "event": event, **fields}) + "\n")
+    except Exception:
+        pass
 
 
 def _hostname():
@@ -80,6 +110,30 @@ def holder_identity():
         return f"pgrp:{os.getsid(0)}"
     except Exception:
         return f"pid:{os.getpid()}"
+
+
+def is_explicit():
+    return bool(os.environ.get("BH_HOLDER"))
+
+
+def owner_pid():
+    """The long-lived process whose life bounds this holder's turn. Order:
+    BH_HOLDER_PID, CLAUDE_PID (the Claude Code process — shared by a session
+    and its subagents, and by a headless `claude -p` tick), the POSIX session
+    leader, the parent. A candidate that is not alive is skipped; a session
+    leader that is this very process (we were setsid'd) falls through to the
+    parent, since our own pid dies with this call."""
+    for var in ("BH_HOLDER_PID", "CLAUDE_PID"):
+        v = os.environ.get(var, "")
+        if v.isdigit() and int(v) > 0 and _pid_alive(int(v)):
+            return int(v)
+    try:
+        sid = os.getsid(0)
+        if sid > 0 and sid != os.getpid():
+            return sid
+    except Exception:
+        pass
+    return os.getppid()
 
 
 def _fmt(epoch):
@@ -177,7 +231,7 @@ class _FileLock:
             self._fh.close()
 
 
-def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=None):
+def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=None, owner=None):
     """Acquire or renew the lease for daemon `name`. Returns the lease record.
 
     on_wait(record) is called (if given) each time this call finds a live
@@ -187,10 +241,16 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
 
     Raises LeaseBusy if a live lease held by someone else never frees up
     within `wait` seconds (default BH_LEASE_WAIT, 120s).
+
+    ttl defaults to DEFAULT_TTL for an explicit holder (BH_HOLDER set, or
+    `holder` passed in) and IMPLICIT_TTL otherwise. owner defaults to
+    owner_pid().
     """
-    ttl = DEFAULT_TTL if ttl is None else ttl
+    if ttl is None:
+        ttl = DEFAULT_TTL if (holder or is_explicit()) else IMPLICIT_TTL
     wait = DEFAULT_WAIT if wait is None else wait
     holder = holder or holder_identity()
+    owner = owner or owner_pid()
     deadline = time.time() + wait
     blocking = None
     while True:
@@ -204,20 +264,31 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
                 or _is_dead(record)
             )
             if free:
+                # A renewal keeps the original acquired_at; re-acquiring your
+                # OWN expired lease starts a fresh turn.
+                renewing = (bool(record) and record.get("holder") == holder
+                            and record.get("expires_at", 0) > now)
                 took_over = bool(record) and record.get("holder") != holder
                 new_record = {
                     "holder": holder,
-                    "pid": os.getpid(),
+                    "pid": owner,                    # the OWNER anchor, not this call
+                    "invocation_pid": os.getpid(),
                     "host": _hostname(),
-                    "acquired_at": now,
+                    "acquired_at": record.get("acquired_at", now) if renewing else now,
+                    "heartbeat_at": now,
                     "expires_at": now + ttl,
                 }
                 _write(name, new_record)
-                if took_over and on_takeover:
-                    on_takeover(record)
+                if took_over:
+                    _log(name, "takeover", **{"from": record.get("holder"), "to": holder,
+                         "reason": "expired" if record.get("expires_at", 0) <= now else "owner-dead",
+                         "old_pid": record.get("pid")})
+                    if on_takeover:
+                        on_takeover(record)
                 return new_record
             blocking = record
         if time.time() >= deadline:
+            _log(name, "busy", holder=blocking.get("holder"), waiter=holder)
             raise LeaseBusy(
                 f"browser busy: held by {blocking.get('holder')} since "
                 f"{_fmt(blocking.get('acquired_at'))}, expires {_fmt(blocking.get('expires_at'))}"
