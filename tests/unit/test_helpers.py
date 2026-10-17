@@ -493,6 +493,96 @@ def test_new_tab_creates_and_attaches_in_background(monkeypatch):
     assert not any(method == "Target.activateTarget" for method, _ in calls)
 
 
+def test_new_tab_targets_the_doxa_default_profile_context_when_the_marker_tab_is_found(monkeypatch):
+    calls = []
+
+    def fake_cdp(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "Target.getTargets":
+            return {"targetInfos": [
+                {"type": "page", "url": "https://x.com/i/history", "browserContextId": "wamemba-ctx"},
+                {"type": "page", "url": helpers._DOXA_DEFAULT_PROFILE_MARKER, "browserContextId": "doxa-ctx"},
+            ]}
+        if method == "Target.createTarget":
+            return {"targetId": "target-new"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "session-new"}
+        return {}
+
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
+    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
+
+    assert helpers.new_tab() == "target-new"
+    assert ("Target.createTarget", {"url": "about:blank", "background": True, "browserContextId": "doxa-ctx"}) in calls
+
+
+def test_new_tab_ignores_a_marker_url_on_a_non_page_target(monkeypatch):
+    # An iframe or worker happening to share the marker's origin must not be
+    # mistaken for the Default-profile page itself.
+    calls = []
+
+    def fake_cdp(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "Target.getTargets":
+            return {"targetInfos": [{"type": "iframe", "url": helpers._DOXA_DEFAULT_PROFILE_MARKER, "browserContextId": "doxa-ctx"}]}
+        if method == "Target.createTarget":
+            return {"targetId": "target-new"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "session-new"}
+        return {}
+
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
+    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
+
+    helpers.new_tab()
+    assert ("Target.createTarget", {"url": "about:blank", "background": True}) in calls
+
+
+def test_new_tab_falls_back_to_default_context_when_no_marker_tab_exists(monkeypatch):
+    # Most hosts: the marker tab never exists, so behaviour is unchanged.
+    calls = []
+
+    def fake_cdp(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "Target.getTargets":
+            return {"targetInfos": [{"type": "page", "url": "https://example.com", "browserContextId": "some-ctx"}]}
+        if method == "Target.createTarget":
+            return {"targetId": "target-new"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "session-new"}
+        return {}
+
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
+    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
+
+    helpers.new_tab()
+    assert ("Target.createTarget", {"url": "about:blank", "background": True}) in calls
+
+
+def test_new_tab_falls_back_when_target_getTargets_raises(monkeypatch):
+    calls = []
+
+    def fake_cdp(method, **kwargs):
+        if method == "Target.getTargets":
+            raise RuntimeError("daemon not reachable")
+        calls.append((method, kwargs))
+        if method == "Target.createTarget":
+            return {"targetId": "target-new"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "session-new"}
+        return {}
+
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
+    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
+
+    assert helpers.new_tab() == "target-new"
+    assert ("Target.createTarget", {"url": "about:blank", "background": True}) in calls
+
+
 def test_new_tab_reuses_an_empty_data_document(monkeypatch):
     calls = []
     monkeypatch.setattr(

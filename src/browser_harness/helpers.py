@@ -691,6 +691,35 @@ def _may_reuse_attached_tab():
         return False
 
 
+# A harmless, always-loadable marker tab openclaw's scripts/automation-browser.sh
+# keeps open in the Default (garth@doxa.app) profile of the shared automation
+# Chrome (CDP :9223) — same literal on both sides, see that script's comment.
+_DOXA_DEFAULT_PROFILE_MARKER = "https://doxa.app/?automation-default-profile-marker=1"
+
+
+def _doxa_default_profile_context_id():
+    """Best-effort browserContextId of openclaw's Default (garth@doxa.app)
+    profile, found by matching the marker tab among the browser's existing
+    targets. None almost everywhere (no such tab): behaviour is unchanged.
+
+    Why: Target.createTarget with no browserContextId lands in Chrome's
+    notion of the "default" browser context, which on a shared, multi-profile
+    Chrome is whichever profile window was most recently active — NOT
+    necessarily the Default profile. On 2026-10-17 that silently put new_tab()
+    tabs in a different profile's (garth@wamemba.me) window. Matching an
+    existing target's profile sidesteps guessing at — or hard-coding — a
+    context id, which is not stable across a Chrome restart anyway.
+    """
+    try:
+        targets = cdp("Target.getTargets").get("targetInfos", [])
+    except Exception:
+        return None
+    for t in targets:
+        if t.get("type") == "page" and (t.get("url") or "").startswith(_DOXA_DEFAULT_PROFILE_MARKER):
+            return t.get("browserContextId") or None
+    return None
+
+
 def new_tab(url="about:blank"):
     # Always create blank, then goto: passing url to createTarget races with
     # attach, so the brief about:blank is "complete" by the time the caller
@@ -709,7 +738,11 @@ def new_tab(url="about:blank"):
                 return cur.get("targetId") or cur.get("target_id")
         except Exception:
             pass
-    tid = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+    create_params = {"url": "about:blank", "background": True}
+    context_id = _doxa_default_profile_context_id()
+    if context_id:
+        create_params["browserContextId"] = context_id
+    tid = cdp("Target.createTarget", **create_params)["targetId"]
     switch_tab(tid)
     if url != "about:blank":
         goto_url(url)
