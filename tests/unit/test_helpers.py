@@ -562,6 +562,83 @@ def test_new_tab_falls_back_to_default_context_when_no_marker_tab_exists(monkeyp
     assert ("Target.createTarget", {"url": "about:blank", "background": True}) in calls
 
 
+def test_new_tab_refuses_to_reuse_an_attached_blank_tab_in_the_wrong_profile(monkeypatch):
+    # The 2026-10-17 shape: the daemon is attached to a blank tab that sits in
+    # the Wamemba profile's window while the Default profile's marker tab
+    # (and context) is known — reuse must not hijack it.
+    calls = []
+
+    def fake_cdp(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "Target.getTargets":
+            return {"targetInfos": [
+                {"type": "page", "url": "about:blank", "targetId": "wamemba-blank-tab", "browserContextId": "wamemba-ctx"},
+                {"type": "page", "url": helpers._DOXA_DEFAULT_PROFILE_MARKER, "targetId": "doxa-marker-tab", "browserContextId": "doxa-ctx"},
+            ]}
+        if method == "Target.createTarget":
+            return {"targetId": "target-new"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "session-new"}
+        return {}
+
+    monkeypatch.setattr(helpers, "current_tab", lambda: {"targetId": "wamemba-blank-tab", "url": "about:blank"})
+    monkeypatch.setattr(helpers, "goto_url", lambda url: calls.append(("goto_url", url)))
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
+    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
+
+    # Returning the NEW target (not "wamemba-blank-tab") is the proof the
+    # reuse path was refused — reuse would short-circuit before createTarget.
+    assert helpers.new_tab("https://example.com") == "target-new"
+    assert ("Target.createTarget", {"url": "about:blank", "background": True, "browserContextId": "doxa-ctx"}) in calls
+
+
+def test_new_tab_still_reuses_an_attached_blank_tab_already_in_the_doxa_context(monkeypatch):
+    calls = []
+
+    def fake_cdp(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "Target.getTargets":
+            return {"targetInfos": [
+                {"type": "page", "url": "about:blank", "targetId": "doxa-blank-tab", "browserContextId": "doxa-ctx"},
+                {"type": "page", "url": helpers._DOXA_DEFAULT_PROFILE_MARKER, "targetId": "doxa-marker-tab", "browserContextId": "doxa-ctx"},
+            ]}
+        return {}
+
+    monkeypatch.setattr(helpers, "current_tab", lambda: {"targetId": "doxa-blank-tab", "url": "about:blank"})
+    monkeypatch.setattr(helpers, "goto_url", lambda url: calls.append(("goto_url", url)))
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+
+    assert helpers.new_tab("https://example.com") == "doxa-blank-tab"
+    assert ("goto_url", "https://example.com") in calls
+    assert not any(method == "Target.createTarget" for method, _ in calls)
+
+
+def test_new_tab_falls_back_when_the_doxa_context_id_is_stale(monkeypatch):
+    # The Default profile's window can close between the context lookup and
+    # Target.createTarget; a dead browserContextId must not crash new_tab().
+    calls = []
+
+    def fake_cdp(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "Target.getTargets":
+            return {"targetInfos": [{"type": "page", "url": helpers._DOXA_DEFAULT_PROFILE_MARKER, "browserContextId": "stale-ctx"}]}
+        if method == "Target.createTarget":
+            if kwargs.get("browserContextId") == "stale-ctx":
+                raise RuntimeError("No browser context with id stale-ctx")
+            return {"targetId": "target-fallback"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "session-new"}
+        return {}
+
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
+    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
+
+    assert helpers.new_tab() == "target-fallback"
+    assert ("Target.createTarget", {"url": "about:blank", "background": True}) in calls
+
+
 def test_new_tab_falls_back_when_target_getTargets_raises(monkeypatch):
     calls = []
 
@@ -598,7 +675,7 @@ def test_new_tab_reuses_an_empty_data_document(monkeypatch):
     )
 
     assert helpers.new_tab("https://example.com") == "target-placeholder"
-    assert calls == [("goto_url", "https://example.com")]
+    assert calls == [("Target.getTargets", {}), ("goto_url", "https://example.com")]
 
 
 # --- press_key physical key identity (#685) ---
