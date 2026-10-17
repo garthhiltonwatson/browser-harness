@@ -691,25 +691,84 @@ def _may_reuse_attached_tab():
         return False
 
 
+# A harmless, always-loadable marker tab openclaw's scripts/automation-browser.sh
+# keeps open in the Default (garth@doxa.app) profile of the shared automation
+# Chrome (CDP :9223) — same literal on both sides, see that script's comment.
+_DOXA_DEFAULT_PROFILE_MARKER = "https://doxa.app/?automation-default-profile-marker=1"
+
+
+def _doxa_default_profile_targets():
+    """The browser's current targets, or [] if they can't be read. Shared by
+    new_tab()'s context lookup and its reused-tab profile check so both see
+    the same snapshot and neither issues a redundant CDP call."""
+    try:
+        return cdp("Target.getTargets").get("targetInfos", [])
+    except Exception:
+        return []
+
+
+def _doxa_default_profile_context_id(targets):
+    """Best-effort browserContextId of openclaw's Default (garth@doxa.app)
+    profile, found by matching the marker tab among `targets`. None almost
+    everywhere (no such tab): behaviour is unchanged.
+
+    Why: Target.createTarget with no browserContextId lands in Chrome's
+    notion of the "default" browser context, which on a shared, multi-profile
+    Chrome is whichever profile window was most recently active — NOT
+    necessarily the Default profile. On 2026-10-17 that silently put new_tab()
+    tabs in a different profile's (garth@wamemba.me) window. Matching an
+    existing target's profile sidesteps guessing at — or hard-coding — a
+    context id, which is not stable across a Chrome restart anyway.
+    """
+    for t in targets:
+        if t.get("type") == "page" and (t.get("url") or "").startswith(_DOXA_DEFAULT_PROFILE_MARKER):
+            return t.get("browserContextId") or None
+    return None
+
+
 def new_tab(url="about:blank"):
     # Always create blank, then goto: passing url to createTarget races with
     # attach, so the brief about:blank is "complete" by the time the caller
     # polls and wait_for_load() returns before navigation actually starts.
+    doxa_targets = _doxa_default_profile_targets()
+    context_id = _doxa_default_profile_context_id(doxa_targets)
+    # Only populated when context_id is known — used below to refuse reusing
+    # an attached tab that turns out to be in a DIFFERENT profile's context.
+    doxa_tab_ids = {t.get("targetId") for t in doxa_targets if t.get("browserContextId") == context_id} if context_id else None
+
     if url != "about:blank" and _may_reuse_attached_tab():
         try:
             cur = current_tab()
+        except Exception:
+            cur = None
+        if cur is not None:
             cur_url = cur.get("url") or ""
-            # Reuse attached tab when it's blank
-            if (
+            cur_id = cur.get("targetId") or cur.get("target_id")
+            # A known Default-profile context exists: the attached tab must
+            # already be IN it to be reused, or a blank tab in some other
+            # profile's window (2026-10-17: garth@wamemba.me) gets hijacked.
+            in_doxa_context = doxa_tab_ids is None or cur_id in doxa_tab_ids
+            if in_doxa_context and (
                 cur_url in ("", "about:blank", "data:text/html,")
                 or cur_url.startswith("about:blank#")
                 or cur_url.startswith(("chrome://newtab", "chrome://new-tab-page", "edge://newtab", "about:newtab"))
             ):
-                goto_url(url)
-                return cur.get("targetId") or cur.get("target_id")
-        except Exception:
-            pass
-    tid = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+                try:
+                    goto_url(url)
+                    return cur_id
+                except Exception:
+                    pass
+    create_params = {"url": "about:blank", "background": True}
+    if context_id:
+        create_params["browserContextId"] = context_id
+    try:
+        tid = cdp("Target.createTarget", **create_params)["targetId"]
+    except Exception:
+        if "browserContextId" not in create_params:
+            raise
+        # Stale/invalid context (e.g. the Default profile's window closed
+        # between the lookup above and here) — fall back rather than crash.
+        tid = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
     switch_tab(tid)
     if url != "about:blank":
         goto_url(url)
