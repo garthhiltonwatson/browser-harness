@@ -653,13 +653,14 @@ def _launcher_env(monkeypatch, targets_after_launch):
     def fake_cdp(method, **kwargs):
         calls.append((method, kwargs))
         if method == "Target.getTargets":
-            tag = popen[-1][-1].split("bhtab=")[1] if popen else None
-            return {"targetInfos": [dict(t, url=t["url"] + "?bhtab=" + tag) for t in targets_after_launch] if tag else []}
+            # The launched tab carries the tag on its blank page (popen argv's last item).
+            return {"targetInfos": [dict(t, url=popen[-1][-1]) for t in targets_after_launch] if popen else []}
         return {}
 
     monkeypatch.setattr(helpers, "cdp", fake_cdp)
     monkeypatch.setattr(helpers, "switch_tab", lambda tid: calls.append(("switch", tid)))
     monkeypatch.setattr(helpers, "_own_tab", lambda tid: calls.append(("own", tid)))
+    monkeypatch.setattr(helpers, "goto_url", lambda url: calls.append(("goto", url)))
     return calls, popen
 
 
@@ -668,7 +669,24 @@ def test_doxa_launcher_adopts_the_tab_opened_in_the_default_profile(monkeypatch)
 
     assert helpers._doxa_open_in_default_profile("https://x.com/home", "doxa-ctx") == "t-doxa"
     assert "--profile-directory=Default" in popen[0]
+    assert popen[0][-1].startswith("about:blank#bhtab=")  # caller's URL never carries the tag
     assert ("own", "t-doxa") in calls and ("switch", "t-doxa") in calls
+    assert calls.index(("switch", "t-doxa")) < calls.index(("goto", "https://x.com/home"))
+
+
+def test_new_tab_raises_without_launching_when_createTarget_fails_for_another_reason(monkeypatch):
+    def fake_cdp(method, **kwargs):
+        if method == "Target.getTargets":
+            return {"targetInfos": [{"type": "page", "url": helpers._DOXA_DEFAULT_PROFILE_MARKER, "browserContextId": "doxa-ctx"}]}
+        if method == "Target.createTarget":
+            raise TimeoutError("ipc timeout")
+        return {}
+
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    monkeypatch.setattr(helpers, "_doxa_open_in_default_profile", lambda *a: pytest.fail("launcher must not run"))
+
+    with pytest.raises(TimeoutError):
+        helpers.new_tab()
 
 
 def test_doxa_launcher_refuses_a_tab_that_lands_in_another_profile(monkeypatch):

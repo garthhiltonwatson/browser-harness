@@ -730,12 +730,12 @@ def _doxa_open_in_default_profile(url, context_id):
     """Open `url` in the Default (garth@doxa.app) profile by launching the
     automation Chrome with --profile-directory=Default (Chrome hands the URL
     to the running instance), then adopt the new tab by a unique tag in its
-    URL. Raises if the tab does not appear in `context_id`."""
+    URL, then navigate it to `url`. Raises if the tab does not appear in
+    `context_id`. The tag rides on a blank page, so a redirect cannot strip
+    it and the caller's URL is never altered."""
     import subprocess, uuid
     tag = uuid.uuid4().hex[:8]
-    if url == "about:blank":
-        url = _DOXA_DEFAULT_PROFILE_MARKER
-    tagged = url + ("&" if "?" in url else "?") + "bhtab=" + tag
+    tagged = "about:blank#bhtab=" + tag
     binary = os.environ.get("BH_DOXA_CHROME_BINARY", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
     user_data = os.environ.get("BH_DOXA_CHROME_USER_DATA_DIR", os.path.expanduser("~/.doxa-automation-chrome"))
     subprocess.Popen([binary, "--user-data-dir=" + user_data, "--profile-directory=Default", tagged],
@@ -751,6 +751,8 @@ def _doxa_open_in_default_profile(url, context_id):
                     cdp("Target.closeTarget", targetId=t["targetId"])
                     raise RuntimeError("new_tab: launched tab is not in the Default profile context")
                 switch_tab(t["targetId"])
+                if url != "about:blank":
+                    goto_url(url)
                 return t["targetId"]
     raise RuntimeError("new_tab: tab did not appear in the Default profile")
 
@@ -792,8 +794,11 @@ def new_tab(url="about:blank"):
         create_params["browserContextId"] = context_id
     try:
         tid = cdp("Target.createTarget", **create_params)["targetId"]
-    except Exception:
-        if "browserContextId" not in create_params:
+    except Exception as e:
+        # Only Chrome's "context not found" refusal goes to the launcher; any
+        # other failure (Chrome down, IPC timeout) raises, so a launch never
+        # starts a Chrome without the debug port on the automation profile.
+        if "browserContextId" not in create_params or "context" not in str(e).lower():
             raise
         # Chrome refuses createTarget for a PROFILE's context ("Failed to
         # find browser context") — it only accepts contexts CDP itself made.
