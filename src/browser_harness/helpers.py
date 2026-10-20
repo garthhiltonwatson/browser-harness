@@ -726,6 +726,37 @@ def _doxa_default_profile_context_id(targets):
     return None
 
 
+def _doxa_open_in_default_profile(url, context_id):
+    """Open `url` in the Default (garth@doxa.app) profile by launching the
+    automation Chrome with --profile-directory=Default (Chrome hands the URL
+    to the running instance), then adopt the new tab by a unique tag in its
+    URL, then navigate it to `url`. Raises if the tab does not appear in
+    `context_id`. The tag rides on a blank page, so a redirect cannot strip
+    it and the caller's URL is never altered."""
+    import subprocess, uuid
+    tag = uuid.uuid4().hex[:8]
+    tagged = "about:blank#bhtab=" + tag
+    binary = os.environ.get("BH_DOXA_CHROME_BINARY", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    user_data = os.environ.get("BH_DOXA_CHROME_USER_DATA_DIR", os.path.expanduser("~/.doxa-automation-chrome"))
+    subprocess.Popen([binary, "--user-data-dir=" + user_data, "--profile-directory=Default", tagged],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(40):
+        time.sleep(0.5)
+        for t in _doxa_default_profile_targets():
+            if t.get("type") == "page" and "bhtab=" + tag in (t.get("url") or ""):
+                # This run opened it, so it owns it (createTarget's chokepoint
+                # never saw it) — also lets the close below pass the guard.
+                _own_tab(t["targetId"])
+                if t.get("browserContextId") != context_id:
+                    cdp("Target.closeTarget", targetId=t["targetId"])
+                    raise RuntimeError("new_tab: launched tab is not in the Default profile context")
+                switch_tab(t["targetId"])
+                if url != "about:blank":
+                    goto_url(url)
+                return t["targetId"]
+    raise RuntimeError("new_tab: tab did not appear in the Default profile")
+
+
 def new_tab(url="about:blank"):
     # Always create blank, then goto: passing url to createTarget races with
     # attach, so the brief about:blank is "complete" by the time the caller
@@ -763,12 +794,19 @@ def new_tab(url="about:blank"):
         create_params["browserContextId"] = context_id
     try:
         tid = cdp("Target.createTarget", **create_params)["targetId"]
-    except Exception:
-        if "browserContextId" not in create_params:
+    except Exception as e:
+        # Only Chrome's "context not found" refusal goes to the launcher; any
+        # other failure (Chrome down, IPC timeout) raises, so a launch never
+        # starts a Chrome without the debug port on the automation profile.
+        if "browserContextId" not in create_params or "context" not in str(e).lower():
             raise
-        # Stale/invalid context (e.g. the Default profile's window closed
-        # between the lookup above and here) — fall back rather than crash.
-        tid = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+        # Chrome refuses createTarget for a PROFILE's context ("Failed to
+        # find browser context") — it only accepts contexts CDP itself made.
+        # A context-less createTarget lands in the last-active profile
+        # (2026-10-20: an X post went out from garth@wamemba.me's window),
+        # so ask Chrome to open the URL in the Default profile and adopt it.
+        # No silent fallback to another profile: fail loud instead.
+        return _doxa_open_in_default_profile(url, context_id)
     switch_tab(tid)
     if url != "about:blank":
         goto_url(url)
