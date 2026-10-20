@@ -83,6 +83,10 @@ def _env_disabled() -> bool:
     return any((os.environ.get(name) or "").lower() in {"0", "false", "no", "off"} for name in DISABLE_ENVS)
 
 
+def _env_enabled() -> bool:
+    return any((os.environ.get(name) or "").lower() in {"1", "true", "yes", "on"} for name in DISABLE_ENVS)
+
+
 def _valid_install_id(raw) -> bool:
     return isinstance(raw, str) and re.fullmatch(r"[0-9a-f-]{32,36}", raw) is not None
 
@@ -99,20 +103,37 @@ def _install_id(config: dict | None = None, *, create: bool = True) -> str | Non
     return install_id
 
 
+def _config_opted_in(config: dict) -> bool:
+    # Off by default. Telemetry is sent only on an EXPLICIT opt-in. The legacy
+    # {"disabled": false} flag counts as an opt-in so an old opted-in config is
+    # honoured, but an ABSENT flag (a fresh install) now means OFF, not ON.
+    if "enabled" in config:
+        return bool(config.get("enabled"))
+    if "disabled" in config:
+        return not bool(config.get("disabled"))
+    return False
+
+
 def is_enabled() -> bool:
+    # Explicit env opt-out always wins; then explicit env opt-in; else config,
+    # which defaults to OFF.
     if _env_disabled():
         return False
-    return not bool(_load_config().get("disabled"))
+    if _env_enabled():
+        return True
+    return _config_opted_in(_load_config())
 
 
 def status() -> dict:
     config = _load_config()
     env_disabled = _env_disabled()
-    enabled = not env_disabled and not bool(config.get("disabled"))
+    env_enabled = _env_enabled()
+    enabled = is_enabled()
     return {
         "enabled": enabled,
         "disabled_by_env": env_disabled,
-        "disabled_by_config": bool(config.get("disabled")),
+        "enabled_by_env": env_enabled and not env_disabled,
+        "opted_in_by_config": _config_opted_in(config),
         "install_id": _install_id(config, create=enabled),
         "config_path": str(_config_path()),
     }
@@ -120,7 +141,10 @@ def status() -> dict:
 
 def set_enabled(enabled: bool) -> dict:
     config = _load_config()
-    config["disabled"] = not enabled
+    # Write the positive opt-in flag and drop the legacy inverted one so the
+    # stored intent is unambiguous.
+    config["enabled"] = bool(enabled)
+    config.pop("disabled", None)
     _save_config(config)
     return status()
 
