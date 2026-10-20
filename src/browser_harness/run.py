@@ -65,7 +65,7 @@ Commands:
   browser-harness video init <recording>      prepare a recording for editing
   browser-harness video review <recording>    compile and review the video
   browser-harness video export <recording> --reviewed   export a verified MP4
-  browser-harness telemetry status    show anonymous telemetry opt-out state
+  browser-harness telemetry status    telemetry is OFF by default; opt in with 'telemetry enable'
   browser-harness --update [-y]    pull the latest version (agents: pass -y)
   browser-harness --reload         stop the daemon so next call picks up code changes
   browser-harness --acquire [label] hold the lease for a multi-call task; prints BH_HOLDER=<token>
