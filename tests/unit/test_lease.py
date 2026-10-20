@@ -415,3 +415,41 @@ def test_heartbeat_never_touches_someone_elses_lease_or_recreates_a_released_one
     lease.release("t1", holder="alice")
     assert lease.heartbeat("t1", holder="alice") is False
     assert lease.status("t1") is None
+
+
+def test_heartbeat_uses_the_short_ttl_for_an_implicit_holder():
+    rec = lease.acquire("t1", holder="sess", ttl=0.05, wait=0)
+    lease._write("t1", {**rec, "explicit": False})
+    lease.heartbeat("t1", holder="sess")
+    ahead = lease.status("t1")["expires_at"] - time.time()
+    assert lease.IMPLICIT_TTL - 5 < ahead <= lease.IMPLICIT_TTL
+
+
+def test_cli_call_that_outlives_its_ttl_still_holds_the_lease_after_it_exits(monkeypatch):
+    """The wiring in run.py: a script whose lease expired while it ran (here
+    forced) and that ends with sys.exit must leave OUR lease renewed, even if
+    it rebinds NAME and BH_HOLDER on the way."""
+    import sys as _sys
+    from io import StringIO
+    from unittest.mock import patch
+    from browser_harness import run
+    monkeypatch.setenv("BH_HOLDER", "longcall")
+    name = run.NAME
+    monkeypatch.setattr(run, "NAME", name)  # the script rebinds it; restored after the test
+    script = (
+        "import sys, os\n"
+        "from browser_harness import lease as L\n"
+        "r = L.status(NAME); L._write(NAME, {**r, 'expires_at': 0})\n"
+        "NAME = 'elsewhere'; os.environ['BH_HOLDER'] = 'someone-else'\n"
+        "sys.exit(3)\n"
+    )
+    with patch.object(_sys, "argv", ["browser-harness"]), \
+         patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.print_update_banner"), \
+         patch("sys.stdin", StringIO(script)):
+        with pytest.raises(SystemExit) as ex:
+            run.main()
+    assert ex.value.code == 3
+    rec = lease.status(name)
+    assert rec["holder"] == "longcall"
+    assert rec["expires_at"] > time.time() + 60

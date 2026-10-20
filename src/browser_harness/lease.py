@@ -352,7 +352,9 @@ def heartbeat(name, holder=None, ttl=None):
     next call (the full-text expander) could renew. The expander then waited
     15 minutes and failed with exit 75. Ending each call with a heartbeat gives
     the still-living owner a full TTL to make its next call. Never touches
-    another holder's lease, and never recreates a released one."""
+    another holder's lease, and never recreates a released one. It keeps
+    acquired_at (same turn, same owner), unlike acquire() re-taking an
+    already-expired lease, which starts a new turn."""
     holder = holder or holder_identity()
     with _FileLock(name):
         record = _read(name)

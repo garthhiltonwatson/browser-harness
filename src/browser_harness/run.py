@@ -465,7 +465,7 @@ def _run(args):
         sys.exit(USAGE)
     print_update_banner()
     try:
-        _lease.acquire(
+        _held = _lease.acquire(
             NAME,
             on_wait=_lease_waiting,
             on_takeover=lambda rec: print(
@@ -502,13 +502,16 @@ def _run(args):
             print(f"browser-harness: {e}", file=sys.stderr)
             sys.exit(1)
     _install_helper_trace()
+    # Captured before exec: the script runs in this module's globals and could rebind
+    # NAME / _lease or change BH_HOLDER; the end-of-call heartbeat must still hit OUR lease.
+    _hb_lease, _hb_name, _hb_holder = _lease, NAME, _held["holder"]
     try:
         exec(code, globals())
     finally:
         # A call longer than the TTL ends with an already-expired lease; renew it
         # so the same owner's next call is not beaten to it (lease.heartbeat()).
         try:
-            _lease.heartbeat(NAME)
+            _hb_lease.heartbeat(_hb_name, holder=_hb_holder)
         except Exception:
             pass
 
