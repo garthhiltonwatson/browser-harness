@@ -635,8 +635,49 @@ def test_new_tab_falls_back_when_the_doxa_context_id_is_stale(monkeypatch):
     monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
     monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
 
-    assert helpers.new_tab() == "target-fallback"
-    assert ("Target.createTarget", {"url": "about:blank", "background": True}) in calls
+    launched = []
+    monkeypatch.setattr(helpers, "_doxa_open_in_default_profile", lambda url, ctx: launched.append((url, ctx)) or "target-launched")
+
+    assert helpers.new_tab() == "target-launched"
+    assert launched == [("about:blank", "stale-ctx")]
+    # Never a context-less createTarget: it lands in the last-active profile.
+    assert ("Target.createTarget", {"url": "about:blank", "background": True}) not in calls
+
+
+def _launcher_env(monkeypatch, targets_after_launch):
+    calls, popen = [], []
+    monkeypatch.setattr(helpers.time, "sleep", lambda s: None)
+    import subprocess
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kw: popen.append(argv))
+
+    def fake_cdp(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "Target.getTargets":
+            tag = popen[-1][-1].split("bhtab=")[1] if popen else None
+            return {"targetInfos": [dict(t, url=t["url"] + "?bhtab=" + tag) for t in targets_after_launch] if tag else []}
+        return {}
+
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    monkeypatch.setattr(helpers, "switch_tab", lambda tid: calls.append(("switch", tid)))
+    monkeypatch.setattr(helpers, "_own_tab", lambda tid: calls.append(("own", tid)))
+    return calls, popen
+
+
+def test_doxa_launcher_adopts_the_tab_opened_in_the_default_profile(monkeypatch):
+    calls, popen = _launcher_env(monkeypatch, [{"type": "page", "url": "https://x.com/home", "targetId": "t-doxa", "browserContextId": "doxa-ctx"}])
+
+    assert helpers._doxa_open_in_default_profile("https://x.com/home", "doxa-ctx") == "t-doxa"
+    assert "--profile-directory=Default" in popen[0]
+    assert ("own", "t-doxa") in calls and ("switch", "t-doxa") in calls
+
+
+def test_doxa_launcher_refuses_a_tab_that_lands_in_another_profile(monkeypatch):
+    calls, _ = _launcher_env(monkeypatch, [{"type": "page", "url": "https://x.com/home", "targetId": "t-other", "browserContextId": "wamemba-ctx"}])
+
+    with pytest.raises(RuntimeError):
+        helpers._doxa_open_in_default_profile("https://x.com/home", "doxa-ctx")
+    assert ("Target.closeTarget", {"targetId": "t-other"}) in calls
+    assert ("switch", "t-other") not in calls
 
 
 def test_new_tab_falls_back_when_target_getTargets_raises(monkeypatch):
