@@ -388,3 +388,30 @@ def test_orphan_under_launchd_never_anchors_on_pid_1(monkeypatch):
     monkeypatch.setattr(lease.os, "getppid", lambda: 1)
     assert lease.holder_identity() == f"pid:{os.getpid()}"
     assert lease.owner_pid() == os.getpid()
+
+
+# --- heartbeat at the end of a call (2026-10-20 x-bookmarks incident) ---------
+
+def test_heartbeat_renews_our_expired_lease_so_a_long_call_keeps_it():
+    """A 26-min harvest outran the 20-min TTL; one second after it returned,
+    another holder took the lease before the same owner's next call. The
+    end-of-call heartbeat must put expires_at back in the future."""
+    rec = lease.acquire("t1", holder="harvest", ttl=0.05, wait=0)
+    lease._write("t1", {**rec, "invocation_pid": _find_dead_pid(), "explicit": True})
+    time.sleep(0.1)
+    assert lease._expired(lease.status("t1"), time.time())
+    assert lease.heartbeat("t1", holder="harvest") is True
+    after = lease.status("t1")
+    assert after["expires_at"] > time.time() + 60
+    assert after["acquired_at"] == rec["acquired_at"]
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="intruder", wait=0.2)
+
+
+def test_heartbeat_never_touches_someone_elses_lease_or_recreates_a_released_one():
+    rec = lease.acquire("t1", holder="alice", ttl=60, wait=0)
+    assert lease.heartbeat("t1", holder="bob") is False
+    assert lease.status("t1")["expires_at"] == rec["expires_at"]
+    lease.release("t1", holder="alice")
+    assert lease.heartbeat("t1", holder="alice") is False
+    assert lease.status("t1") is None

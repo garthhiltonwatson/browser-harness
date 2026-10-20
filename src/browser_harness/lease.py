@@ -341,6 +341,30 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
         time.sleep(max(0.0, min(POLL_INTERVAL, deadline - time.time())))
 
 
+def heartbeat(name, holder=None, ttl=None):
+    """Refresh the expiry of OUR lease at the end of an invocation. Returns True
+    if it refreshed one.
+
+    Why (2026-10-20, x-bookmarks harvest): a single call that runs longer than
+    the TTL never renews its own heartbeat. While it runs, _invocation_alive()
+    protects it; the instant it returns, its expires_at is already in the past,
+    so another holder took the lease one second later, before the same owner's
+    next call (the full-text expander) could renew. The expander then waited
+    15 minutes and failed with exit 75. Ending each call with a heartbeat gives
+    the still-living owner a full TTL to make its next call. Never touches
+    another holder's lease, and never recreates a released one."""
+    holder = holder or holder_identity()
+    with _FileLock(name):
+        record = _read(name)
+        if not record or record.get("holder") != holder:
+            return False
+        if ttl is None:
+            ttl = DEFAULT_TTL if record.get("explicit") else IMPLICIT_TTL
+        now = time.time()
+        _write(name, {**record, "heartbeat_at": now, "expires_at": now + ttl})
+        return True
+
+
 def release(name, holder=None):
     """Release the lease iff it is still held by `holder` (default: our own
     identity). Returns True if it released a lease, False otherwise (no

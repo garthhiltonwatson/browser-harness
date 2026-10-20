@@ -502,7 +502,15 @@ def _run(args):
             print(f"browser-harness: {e}", file=sys.stderr)
             sys.exit(1)
     _install_helper_trace()
-    exec(code, globals())
+    try:
+        exec(code, globals())
+    finally:
+        # A call longer than the TTL ends with an already-expired lease; renew it
+        # so the same owner's next call is not beaten to it (lease.heartbeat()).
+        try:
+            _lease.heartbeat(NAME)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
