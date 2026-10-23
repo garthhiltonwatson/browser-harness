@@ -697,6 +697,11 @@ def _may_reuse_attached_tab():
 _DOXA_DEFAULT_PROFILE_MARKER = "https://doxa.app/?automation-default-profile-marker=1"
 
 
+# The page the launcher opens to adopt a tab: same harmless origin as the
+# marker, but a different query so it is never mistaken for the marker tab.
+_DOXA_LAUNCH_TAG_URL = "https://doxa.app/?automation-new-tab=1"
+
+
 def _doxa_default_profile_targets():
     """The browser's current targets, or [] if they can't be read. Shared by
     new_tab()'s context lookup and its reused-tab profile check so both see
@@ -731,11 +736,17 @@ def _doxa_open_in_default_profile(url, context_id):
     automation Chrome with --profile-directory=Default (Chrome hands the URL
     to the running instance), then adopt the new tab by a unique tag in its
     URL, then navigate it to `url`. Raises if the tab does not appear in
-    `context_id`. The tag rides on a blank page, so a redirect cannot strip
-    it and the caller's URL is never altered."""
+    `context_id`. The tag rides in the fragment of a fixed https page, so a
+    redirect keeps it and the caller's URL is never altered.
+
+    Not about:blank: Chrome drops an about: URL handed to an already-running
+    instance on the command line and opens a New Tab Page instead, so the tag
+    never appeared, every call raised after 20 s, and each try leaked one
+    chrome://newtab tab (2026-10-21..24: x-bookmarks harvests and social legs
+    parked on "tab did not appear in the Default profile")."""
     import subprocess, uuid
     tag = uuid.uuid4().hex[:8]
-    tagged = "about:blank#bhtab=" + tag
+    tagged = _DOXA_LAUNCH_TAG_URL + "#bhtab=" + tag
     binary = os.environ.get("BH_DOXA_CHROME_BINARY", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
     user_data = os.environ.get("BH_DOXA_CHROME_USER_DATA_DIR", os.path.expanduser("~/.doxa-automation-chrome"))
     subprocess.Popen([binary, "--user-data-dir=" + user_data, "--profile-directory=Default", tagged],

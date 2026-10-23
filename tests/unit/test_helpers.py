@@ -669,7 +669,10 @@ def test_doxa_launcher_adopts_the_tab_opened_in_the_default_profile(monkeypatch)
 
     assert helpers._doxa_open_in_default_profile("https://x.com/home", "doxa-ctx") == "t-doxa"
     assert "--profile-directory=Default" in popen[0]
-    assert popen[0][-1].startswith("about:blank#bhtab=")  # caller's URL never carries the tag
+    # https, never about:blank — Chrome drops an about: URL handed to a running
+    # instance and opens a New Tab Page, so the tag never appeared (2026-10-24).
+    assert popen[0][-1].startswith("https://doxa.app/?automation-new-tab=1#bhtab=")  # caller's URL never carries the tag
+    assert not popen[0][-1].startswith(helpers._DOXA_DEFAULT_PROFILE_MARKER)  # never mistaken for the marker
     assert ("own", "t-doxa") in calls and ("switch", "t-doxa") in calls
     assert calls.index(("switch", "t-doxa")) < calls.index(("goto", "https://x.com/home"))
 
