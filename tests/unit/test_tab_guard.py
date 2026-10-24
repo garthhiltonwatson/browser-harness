@@ -154,6 +154,44 @@ def test_new_tab_does_not_reuse_a_blank_tab_the_run_does_not_own(guard):
     assert helpers._may_reuse_attached_tab() is False
 
 
+def test_new_tab_from_a_foreign_tab_logs_no_refusal(guard, tmp_path, monkeypatch, capsys):
+    # switch_tab() un-marks the PREVIOUS tab first. When that tab is not the
+    # run's own, the un-mark must be skipped, not attempted and refused: each
+    # attempt logged a REFUSED line, so every new_tab() looked like the run
+    # reaching for a foreign tab (17 false near-miss issues, 2026-09..10).
+    log = tmp_path / "guard.log"
+    monkeypatch.setenv("BH_TAB_GUARD_LOG", str(log))
+    sent, attached = [], dict(FOREIGN)
+
+    def send(req, response_timeout=None):
+        sent.append(req)
+        if req.get("meta") == "set_session":  # the daemon re-attaches, as live
+            attached.update(targetId=req["target_id"], url="about:blank")
+        return _fake_send(current=attached)(req)
+    monkeypatch.setattr(helpers, "_send", send)
+    assert helpers.new_tab() == "MINE"
+    assert "REFUSED" not in capsys.readouterr().err
+    assert not log.exists()
+
+
+def test_switch_tab_still_unmarks_a_tab_the_run_owns(owning, monkeypatch):
+    sent = []
+    send = _fake_send(current={"targetId": "MINE", "url": "https://example.com/", "title": "t"})
+    monkeypatch.setattr(helpers, "_send", lambda req, response_timeout=None: (sent.append(req), send(req))[1])
+    helpers.switch_tab("MINE")
+    assert any(r.get("method") == "Runtime.evaluate" and "slice(3)" in r["params"]["expression"] for r in sent)
+
+
+def test_switch_tab_unmarks_any_tab_with_the_guard_off(tmp_path, monkeypatch):
+    monkeypatch.delenv("BH_TAB_GUARD", raising=False)
+    monkeypatch.setattr(helpers.ipc, "_TMP", tmp_path)
+    sent = []
+    send = _fake_send()
+    monkeypatch.setattr(helpers, "_send", lambda req, response_timeout=None: (sent.append(req), send(req))[1])
+    helpers.switch_tab("X")
+    assert any(r.get("method") == "Runtime.evaluate" and "slice(3)" in r["params"]["expression"] for r in sent)
+
+
 def test_new_tab_may_still_reuse_a_blank_tab_the_run_opened(owning):
     assert helpers._may_reuse_attached_tab() is True
 
