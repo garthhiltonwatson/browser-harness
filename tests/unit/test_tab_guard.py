@@ -172,7 +172,6 @@ def test_new_tab_from_a_foreign_tab_logs_no_refusal(guard, tmp_path, monkeypatch
     assert helpers.new_tab() == "MINE"
     assert "REFUSED" not in capsys.readouterr().err
     assert not log.exists()
-    assert not any(r.get("method") == "Runtime.evaluate" and "slice(3)" in r["params"]["expression"] for r in sent)
 
 
 def test_switch_tab_still_unmarks_a_tab_the_run_owns(owning, monkeypatch):
@@ -180,6 +179,16 @@ def test_switch_tab_still_unmarks_a_tab_the_run_owns(owning, monkeypatch):
     send = _fake_send(current={"targetId": "MINE", "url": "https://example.com/", "title": "t"})
     monkeypatch.setattr(helpers, "_send", lambda req, response_timeout=None: (sent.append(req), send(req))[1])
     helpers.switch_tab("MINE")
+    assert any(r.get("method") == "Runtime.evaluate" and "slice(3)" in r["params"]["expression"] for r in sent)
+
+
+def test_switch_tab_unmarks_any_tab_with_the_guard_off(tmp_path, monkeypatch):
+    monkeypatch.delenv("BH_TAB_GUARD", raising=False)
+    monkeypatch.setattr(helpers.ipc, "_TMP", tmp_path)
+    sent = []
+    send = _fake_send()
+    monkeypatch.setattr(helpers, "_send", lambda req, response_timeout=None: (sent.append(req), send(req))[1])
+    helpers.switch_tab("X")
     assert any(r.get("method") == "Runtime.evaluate" and "slice(3)" in r["params"]["expression"] for r in sent)
 
 
