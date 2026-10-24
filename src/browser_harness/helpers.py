@@ -665,8 +665,12 @@ def switch_tab(target, activate=False):
     target_id = _target_id(target)
     # Unmark old tab. Horse emoji is a surrogate pair in JS UTF-16 strings (2 code units),
     # plus the trailing space = 3 code units, so slice(3) cleanly removes the prefix.
-    try: cdp("Runtime.evaluate", expression="if(document.title.startsWith('\U0001F434 '))document.title=document.title.slice(3)")
-    except Exception: pass
+    # Under the tab guard, only un-mark a tab this run owns (it is the only kind
+    # it marked). Attempting it on any other tab is refused AND logged, so every
+    # new_tab() from a foreign or unresolvable tab read as a near-miss.
+    if not _tab_guard_on() or _current_target() in _owned_ids():
+        try: cdp("Runtime.evaluate", expression="if(document.title.startsWith('\U0001F434 '))document.title=document.title.slice(3)")
+        except Exception: pass
     if activate:
         activate_tab(target_id)
     sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
