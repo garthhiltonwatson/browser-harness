@@ -699,7 +699,9 @@ _DOXA_DEFAULT_PROFILE_MARKER = "https://doxa.app/?automation-default-profile-mar
 
 # The page the launcher opens to adopt a tab: same harmless origin as the
 # marker, but a different query so it is never mistaken for the marker tab.
-_DOXA_LAUNCH_TAG_URL = "https://doxa.app/?automation-new-tab=1"
+# robots.txt, not the homepage: a static, script-free file, so no analytics
+# pageview fires from the automation profile and the load is instant.
+_DOXA_LAUNCH_TAG_URL = "https://doxa.app/robots.txt?automation-new-tab=1"
 
 
 def _doxa_default_profile_targets():
@@ -762,8 +764,10 @@ def _doxa_open_in_default_profile(url, context_id):
                     cdp("Target.closeTarget", targetId=t["targetId"])
                     raise RuntimeError("new_tab: launched tab is not in the Default profile context")
                 switch_tab(t["targetId"])
-                if url != "about:blank":
-                    goto_url(url)
+                # Always navigate, about:blank included: the tag page must not
+                # stay loaded (a caller asked for a blank tab, and new_tab's
+                # reuse check would never reuse it — one leaked tab per call).
+                goto_url(url)
                 return t["targetId"]
     raise RuntimeError("new_tab: tab did not appear in the Default profile")
 
