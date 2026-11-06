@@ -34,6 +34,14 @@ BH_LEASE_TTL (20 min) for an explicit BH_HOLDER, BH_LEASE_TTL_IMPLICIT
 once does not starve a scheduled tick for long. Takeovers and busy timeouts
 are appended to <stem>.lease.log next to the lease file.
 
+Max hold (2026-11-06): a holder that keeps renewing (an agent that calls the
+browser every few minutes between long non-browser steps) never expires, so a
+scheduled job waited over an hour for its slot (social-posting, 17:04-18:09).
+A waiter now takes over a lease held for BH_LEASE_MAX_HOLD (30 min) since its
+acquired_at, but only between calls (no invocation running). The waiter sets
+the limit, so a time-boxed job can ask for a shorter one. The old holder's
+next call simply waits its turn.
+
 Holder identity (see holder_identity()): BH_HOLDER env if the caller set it;
 else the Claude Code session id (CLAUDE_CODE_SESSION_ID) if present; else this
 process's POSIX session leader — or, for a launchd job (session 1, shared by
@@ -63,6 +71,7 @@ else:
 
 DEFAULT_TTL = float(os.environ.get("BH_LEASE_TTL", 1200))                   # explicit BH_HOLDER: 20 min
 IMPLICIT_TTL = float(os.environ.get("BH_LEASE_TTL_IMPLICIT", 300))         # implicit identity: 5 min
+MAX_HOLD = float(os.environ.get("BH_LEASE_MAX_HOLD", 1800))                # a waiter takes over after 30 min
 DEFAULT_WAIT = float(os.environ.get("BH_LEASE_WAIT", 120))  # 2 min
 POLL_INTERVAL = 2.0
 EXIT_BUSY = 75
@@ -239,6 +248,11 @@ def _expired(record, now):
     return record.get("expires_at", 0) <= now and not _invocation_alive(record)
 
 
+def _over_max_hold(record, now, max_hold):
+    """Held for max_hold seconds since acquired_at, and no call is running."""
+    return now - record.get("acquired_at", now) >= max_hold and not _invocation_alive(record)
+
+
 class _FileLock:
     """flock (POSIX) / msvcrt.locking (Windows) around the lease read-modify-write."""
 
@@ -271,7 +285,8 @@ class _FileLock:
             self._fh.close()
 
 
-def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=None, owner=None):
+def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=None, owner=None,
+            max_hold=None):
     """Acquire or renew the lease for daemon `name`. Returns the lease record.
 
     on_wait(record) is called (if given) each time this call finds a live
@@ -284,12 +299,13 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
 
     ttl defaults to DEFAULT_TTL for an explicit holder (BH_HOLDER set, or
     `holder` passed in) and IMPLICIT_TTL otherwise. owner defaults to
-    owner_pid().
+    owner_pid(). max_hold defaults to MAX_HOLD (BH_LEASE_MAX_HOLD).
     """
     explicit = bool(holder) or is_explicit()
     if ttl is None:
         ttl = DEFAULT_TTL if explicit else IMPLICIT_TTL
     wait = DEFAULT_WAIT if wait is None else wait
+    max_hold = MAX_HOLD if max_hold is None else max_hold
     holder = holder or holder_identity()
     owner, owner_src = (owner, "env") if owner else _owner()
     deadline = time.time() + wait
@@ -303,6 +319,7 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
                 or record.get("holder") == holder
                 or _expired(record, now)
                 or _is_dead(record)
+                or _over_max_hold(record, now, max_hold)
             )
             if free:
                 # A renewal keeps the original acquired_at; re-acquiring your
@@ -324,7 +341,8 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
                 _write(name, new_record)
                 if took_over:
                     _log(name, "takeover", **{"from": record.get("holder"), "to": holder,
-                         "reason": "expired" if record.get("expires_at", 0) <= now else "owner-dead",
+                         "reason": ("expired" if record.get("expires_at", 0) <= now
+                                    else "owner-dead" if _is_dead(record) else "max-hold"),
                          "old_pid": record.get("pid")})
                     if on_takeover:
                         on_takeover(record)

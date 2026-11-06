@@ -453,3 +453,47 @@ def test_cli_call_that_outlives_its_ttl_still_holds_the_lease_after_it_exits(mon
     rec = lease.status(name)
     assert rec["holder"] == "longcall"
     assert rec["expires_at"] > time.time() + 60
+
+
+# --- max hold (2026-11-06: a renewing holder starved social-posting for an hour) ---
+
+def _held_since(seconds_ago, invocation_pid):
+    """A live, unexpired lease whose owner is alive and keeps renewing."""
+    now = time.time()
+    return {"holder": "alice", "pid": os.getpid(), "owner_src": "env", "explicit": True,
+            "invocation_pid": invocation_pid, "host": lease._hostname(),
+            "acquired_at": now - seconds_ago, "heartbeat_at": now, "expires_at": now + 1200}
+
+
+def test_waiter_takes_over_a_lease_held_past_max_hold_between_calls():
+    lease._write("t1", _held_since(1900, _find_dead_pid()))
+    start = time.time()
+    record = lease.acquire("t1", holder="bob", wait=120, max_hold=1800)
+    assert time.time() - start < 1.0
+    assert record["holder"] == "bob"
+    events = [json.loads(line) for line in lease._log_path("t1").read_text().splitlines()]
+    assert any(e["event"] == "takeover" and e["reason"] == "max-hold" for e in events)
+
+
+def test_max_hold_never_interrupts_a_running_call():
+    lease._write("t1", _held_since(1900, os.getpid()))
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="bob", wait=0.1, max_hold=1800)
+
+
+def test_lease_under_max_hold_still_makes_the_waiter_wait():
+    lease._write("t1", _held_since(600, _find_dead_pid()))
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="bob", wait=0.1, max_hold=1800)
+
+
+def test_waiter_can_ask_for_a_shorter_max_hold():
+    lease._write("t1", _held_since(600, _find_dead_pid()))
+    assert lease.acquire("t1", holder="bob", wait=0, max_hold=300)["holder"] == "bob"
+
+
+def test_holder_renewing_past_max_hold_keeps_its_own_lease():
+    lease._write("t1", _held_since(1900, _find_dead_pid()))
+    record = lease.acquire("t1", holder="alice", wait=0, max_hold=1800)
+    assert record["holder"] == "alice"
+    assert time.time() - record["acquired_at"] >= 1900 - 5
