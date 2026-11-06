@@ -37,10 +37,11 @@ are appended to <stem>.lease.log next to the lease file.
 Max hold (2026-11-06): a holder that keeps renewing (an agent that calls the
 browser every few minutes between long non-browser steps) never expires, so a
 scheduled job waited over an hour for its slot (social-posting, 17:04-18:09).
-A waiter now takes over a lease held for BH_LEASE_MAX_HOLD (30 min) since its
-acquired_at, but only between calls (no invocation running). The waiter sets
-the limit, so a time-boxed job can ask for a shorter one. The old holder's
-next call simply waits its turn.
+Each lease now records its holder's max hold, BH_LEASE_MAX_HOLD (15 min by
+default; a scheduled job that needs a long run declares more). Once the lease
+has been held that long since acquired_at, a waiter takes it over, but only
+between calls (no invocation running). The old holder's next call simply
+waits its turn.
 
 Holder identity (see holder_identity()): BH_HOLDER env if the caller set it;
 else the Claude Code session id (CLAUDE_CODE_SESSION_ID) if present; else this
@@ -71,7 +72,7 @@ else:
 
 DEFAULT_TTL = float(os.environ.get("BH_LEASE_TTL", 1200))                   # explicit BH_HOLDER: 20 min
 IMPLICIT_TTL = float(os.environ.get("BH_LEASE_TTL_IMPLICIT", 300))         # implicit identity: 5 min
-MAX_HOLD = float(os.environ.get("BH_LEASE_MAX_HOLD", 1800))                # a waiter takes over after 30 min
+MAX_HOLD = float(os.environ.get("BH_LEASE_MAX_HOLD", 900))                 # holder's turn limit: 15 min
 DEFAULT_WAIT = float(os.environ.get("BH_LEASE_WAIT", 120))  # 2 min
 POLL_INTERVAL = 2.0
 EXIT_BUSY = 75
@@ -248,8 +249,10 @@ def _expired(record, now):
     return record.get("expires_at", 0) <= now and not _invocation_alive(record)
 
 
-def _over_max_hold(record, now, max_hold):
-    """Held for max_hold seconds since acquired_at, and no call is running."""
+def _over_max_hold(record, now):
+    """Held past the holder's own max hold since acquired_at, and no call is
+    running. Records from before max_hold existed get MAX_HOLD."""
+    max_hold = record.get("max_hold", MAX_HOLD)
     return now - record.get("acquired_at", now) >= max_hold and not _invocation_alive(record)
 
 
@@ -299,7 +302,8 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
 
     ttl defaults to DEFAULT_TTL for an explicit holder (BH_HOLDER set, or
     `holder` passed in) and IMPLICIT_TTL otherwise. owner defaults to
-    owner_pid(). max_hold defaults to MAX_HOLD (BH_LEASE_MAX_HOLD).
+    owner_pid(). max_hold (default MAX_HOLD, BH_LEASE_MAX_HOLD) is recorded as
+    this holder's turn limit; past it, a waiter may take over between calls.
     """
     explicit = bool(holder) or is_explicit()
     if ttl is None:
@@ -319,7 +323,7 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
                 or record.get("holder") == holder
                 or _expired(record, now)
                 or _is_dead(record)
-                or _over_max_hold(record, now, max_hold)
+                or _over_max_hold(record, now)
             )
             if free:
                 # A renewal keeps the original acquired_at; re-acquiring your
@@ -337,6 +341,7 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
                     "acquired_at": record.get("acquired_at", now) if renewing else now,
                     "heartbeat_at": now,
                     "expires_at": now + ttl,
+                    "max_hold": max_hold,
                 }
                 _write(name, new_record)
                 if took_over:
