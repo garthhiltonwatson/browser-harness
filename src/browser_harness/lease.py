@@ -41,7 +41,9 @@ Each lease now records its holder's max hold, BH_LEASE_MAX_HOLD (15 min by
 default; a scheduled job that needs a long run declares more). Once the lease
 has been held that long since acquired_at, a waiter takes it over, but only
 between calls (no invocation running). The old holder's next call simply
-waits its turn.
+waits its turn. A renewal keeps the declared limit unless the call sets
+BH_LEASE_MAX_HOLD itself; 0 or less means no limit. The record keeps only the
+last call's pid, so one holder must not run calls in parallel.
 
 Holder identity (see holder_identity()): BH_HOLDER env if the caller set it;
 else the Claude Code session id (CLAUDE_CODE_SESSION_ID) if present; else this
@@ -72,7 +74,7 @@ else:
 
 DEFAULT_TTL = float(os.environ.get("BH_LEASE_TTL", 1200))                   # explicit BH_HOLDER: 20 min
 IMPLICIT_TTL = float(os.environ.get("BH_LEASE_TTL_IMPLICIT", 300))         # implicit identity: 5 min
-MAX_HOLD = float(os.environ.get("BH_LEASE_MAX_HOLD", 900))                 # holder's turn limit: 15 min
+MAX_HOLD = float(os.environ.get("BH_LEASE_MAX_HOLD", 900))                 # holder's turn limit: 15 min; <= 0 = no limit
 DEFAULT_WAIT = float(os.environ.get("BH_LEASE_WAIT", 120))  # 2 min
 POLL_INTERVAL = 2.0
 EXIT_BUSY = 75
@@ -253,6 +255,8 @@ def _over_max_hold(record, now):
     """Held past the holder's own max hold since acquired_at, and no call is
     running. Records from before max_hold existed get MAX_HOLD."""
     max_hold = record.get("max_hold", MAX_HOLD)
+    if max_hold <= 0:
+        return False
     return now - record.get("acquired_at", now) >= max_hold and not _invocation_alive(record)
 
 
@@ -304,11 +308,13 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
     `holder` passed in) and IMPLICIT_TTL otherwise. owner defaults to
     owner_pid(). max_hold (default MAX_HOLD, BH_LEASE_MAX_HOLD) is recorded as
     this holder's turn limit; past it, a waiter may take over between calls.
+    A renewal keeps the recorded limit unless max_hold or the env var is set.
     """
     explicit = bool(holder) or is_explicit()
     if ttl is None:
         ttl = DEFAULT_TTL if explicit else IMPLICIT_TTL
     wait = DEFAULT_WAIT if wait is None else wait
+    declared_max_hold = max_hold is not None or "BH_LEASE_MAX_HOLD" in os.environ
     max_hold = MAX_HOLD if max_hold is None else max_hold
     holder = holder or holder_identity()
     owner, owner_src = (owner, "env") if owner else _owner()
@@ -341,7 +347,8 @@ def acquire(name, ttl=None, wait=None, holder=None, on_wait=None, on_takeover=No
                     "acquired_at": record.get("acquired_at", now) if renewing else now,
                     "heartbeat_at": now,
                     "expires_at": now + ttl,
-                    "max_hold": max_hold,
+                    "max_hold": (max_hold if declared_max_hold or not renewing
+                                 else record.get("max_hold", max_hold)),
                 }
                 _write(name, new_record)
                 if took_over:
