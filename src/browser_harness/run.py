@@ -79,7 +79,9 @@ your Claude Code session id, else your session leader, or the parent for a
 launchd job). The lease
 lives while its owner process (CLAUDE_PID / session leader) lives, until no
 call renews it for BH_LEASE_TTL (explicit, 20 min) or BH_LEASE_TTL_IMPLICIT
-(5 min). Losing a contention wait exits with code 75. See SKILL.md.
+(5 min). A waiter takes over between calls once the lease has been held for
+the holder's BH_LEASE_MAX_HOLD (default 15 min; set it on every call for a
+longer turn). Losing a contention wait exits with code 75. See SKILL.md.
 """
 
 USAGE = """Usage:
@@ -470,7 +472,7 @@ def _run(args):
             on_wait=_lease_waiting,
             on_takeover=lambda rec: print(
                 f"[lease] took over {NAME!r} from {rec.get('holder')} "
-                f"(expired {_lease._fmt(rec.get('expires_at'))} or its process is dead)",
+                "(expired, owner dead, or held past its max hold; see the lease log)",
                 file=sys.stderr, flush=True,
             ),
         )

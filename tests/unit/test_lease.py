@@ -453,3 +453,80 @@ def test_cli_call_that_outlives_its_ttl_still_holds_the_lease_after_it_exits(mon
     rec = lease.status(name)
     assert rec["holder"] == "longcall"
     assert rec["expires_at"] > time.time() + 60
+
+
+# --- max hold (2026-11-06: a renewing holder starved social-posting for an hour) ---
+
+def _held_since(seconds_ago, invocation_pid, **extra):
+    """A live, unexpired lease whose owner is alive and keeps renewing."""
+    now = time.time()
+    return {"holder": "alice", "pid": os.getpid(), "owner_src": "env", "explicit": True,
+            "invocation_pid": invocation_pid, "host": lease._hostname(),
+            "acquired_at": now - seconds_ago, "heartbeat_at": now, "expires_at": now + 1200,
+            **extra}
+
+
+def test_waiter_takes_over_a_lease_held_past_its_max_hold_between_calls():
+    lease._write("t1", _held_since(1000, _find_dead_pid(), max_hold=900))
+    start = time.time()
+    record = lease.acquire("t1", holder="bob", wait=5)
+    assert time.time() - start < 1.0
+    assert record["holder"] == "bob"
+    assert time.time() - record["acquired_at"] < 5  # bob's turn starts now
+    events = [json.loads(line) for line in lease._log_path("t1").read_text().splitlines()]
+    assert any(e["event"] == "takeover" and e["reason"] == "max-hold" for e in events)
+
+
+def test_max_hold_never_interrupts_a_running_call():
+    lease._write("t1", _held_since(1000, os.getpid(), max_hold=900))
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="bob", wait=0.1)
+
+
+def test_lease_under_its_max_hold_still_makes_the_waiter_wait():
+    lease._write("t1", _held_since(600, _find_dead_pid(), max_hold=900))
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="bob", wait=0.1)
+
+
+def test_the_holders_declared_max_hold_wins_over_the_waiters():
+    """A scheduled job that declares a long turn is not cut off by an agent."""
+    lease._write("t1", _held_since(1000, _find_dead_pid(), max_hold=3600))
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="bob", wait=0.1, max_hold=60)
+
+
+def test_record_without_max_hold_gets_the_default():
+    lease._write("t1", _held_since(lease.MAX_HOLD + 60, _find_dead_pid()))
+    assert lease.acquire("t1", holder="bob", wait=0)["holder"] == "bob"
+
+
+def test_acquire_records_the_holders_max_hold():
+    assert lease.acquire("t1", holder="alice", wait=0, max_hold=3600)["max_hold"] == 3600
+    assert lease._read("t1")["max_hold"] == 3600
+
+
+def test_holder_renewing_past_max_hold_keeps_its_own_lease():
+    lease._write("t1", _held_since(1000, _find_dead_pid(), max_hold=900))
+    record = lease.acquire("t1", holder="alice", wait=0)
+    assert record["holder"] == "alice"
+    assert time.time() - record["acquired_at"] >= 1000 - 5
+
+
+def test_renewal_keeps_the_declared_max_hold(monkeypatch):
+    """--acquire with BH_LEASE_MAX_HOLD=3600, then later calls with BH_HOLDER only."""
+    monkeypatch.delenv("BH_LEASE_MAX_HOLD", raising=False)
+    lease.acquire("t1", holder="alice", wait=0, max_hold=3600)
+    assert lease.acquire("t1", holder="alice", wait=0)["max_hold"] == 3600
+
+
+def test_heartbeat_keeps_the_max_hold():
+    lease.acquire("t1", holder="alice", wait=0, max_hold=3600)
+    lease.heartbeat("t1", holder="alice")
+    assert lease._read("t1")["max_hold"] == 3600
+
+
+def test_zero_max_hold_means_no_limit():
+    lease._write("t1", _held_since(100000, _find_dead_pid(), max_hold=0))
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="bob", wait=0.1)
