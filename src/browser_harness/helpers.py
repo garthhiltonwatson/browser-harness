@@ -576,10 +576,39 @@ def scroll(x, y, dy=-300, dx=0):
 
 
 # --- visual ---
+# A password field whose value is shown as text (Chrome "Show password", a
+# sign-in page's eye toggle) must never reach a screenshot: the image lands in
+# agent transcripts. Fields still typed "password" render as dots and are safe.
+_VISIBLE_PASSWORD_JS = """(() => {
+  for (const el of document.querySelectorAll('input')) {
+    // Only text-like inputs can show a typed value; a checkbox's value is "on".
+    if (!['text', 'search', 'email', 'tel', 'url', ''].includes(el.type) || !el.value) continue;
+    const hint = [el.name, el.id, el.autocomplete, el.placeholder,
+      el.getAttribute('aria-label') || ''].join(' ').toLowerCase();
+    if (/passw(or)?d|passwort|\\bpass\\b|\\bpwd\\b|current-password|new-password/.test(hint)) return true;
+  }
+  return false;
+})()"""
+
+
+def _visible_password_on_page():
+    """True only when the check ran and found a visible password value; a page
+    where the check cannot run does not block the screenshot."""
+    try:
+        return js(_VISIBLE_PASSWORD_JS) is True
+    except Exception:
+        return False
+
+
 def capture_screenshot(path=None, full=False, max_dim=None):
     """Save a PNG of the current viewport. Set max_dim=1800 on a 2× display to
     keep the file under the 2000px-per-side limit some image-aware LLMs enforce."""
     path = path or str(ipc._TMP / "shot.png")
+    if _visible_password_on_page():
+        raise RuntimeError(
+            "refusing screenshot: a password field shows its value in plain text "
+            "(untick 'Show password' or leave the sign-in page first)"
+        )
     try:
         r = cdp(
             "Page.captureScreenshot",

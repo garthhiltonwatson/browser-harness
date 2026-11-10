@@ -275,6 +275,8 @@ def _capture(d, helper, args=(), kwargs=None, duration=None):
         if k in event:
             event[k] = _scrub_url(event[k])
     try:
+        if helpers._visible_password_on_page():
+            raise RuntimeError("frame skipped: a password is visible on the page")
         # Same budget capture_screenshot() uses: a cloud screenshot routinely
         # exceeds the 5s default IPC timeout, and every frame here would time
         # out and be swallowed below, leaving a recording with no frames.

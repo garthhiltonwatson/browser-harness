@@ -94,3 +94,18 @@ def test_frame_error_stays_useful_for_a_message_less_exception(tmp_path, monkeyp
     recorder._capture(tmp_path, "click_at_xy", (10, 20), {})
 
     assert _events(tmp_path)[0]["frame_error"] == "RuntimeError: no detail"
+
+
+def test_no_frame_while_a_password_is_visible_but_the_event_is_kept(tmp_path, monkeypatch):
+    cdp = _screenshot_ok()
+    monkeypatch.setattr(helpers, "cdp", cdp)
+    monkeypatch.setattr(helpers, "js", lambda expression: {})
+    monkeypatch.setattr(helpers, "_visible_password_on_page", lambda: True)
+
+    recorder._capture(tmp_path, "click_at_xy", (10, 20), {})
+
+    assert not cdp.calls
+    assert not list(tmp_path.glob("*.jpg"))
+    event = _events(tmp_path)[0]
+    assert "password is visible" in event["frame_error"]
+    assert event["helper"] == "click_at_xy"
