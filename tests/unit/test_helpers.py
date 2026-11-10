@@ -1,4 +1,8 @@
+import json
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 import time
 from unittest.mock import patch
@@ -974,3 +978,42 @@ def test_js_keeps_base_exception_from_evaluation_when_detach_also_raises():
         KeyboardInterrupt, match="evaluation interrupted"
     ):
         helpers.js("7", target_id="iframe-target")
+
+
+def test_screenshot_refuses_when_a_password_is_visible(tmp_path):
+    with patch("browser_harness.helpers.js", return_value=True), patch(
+        "browser_harness.helpers.cdp"
+    ) as cdp:
+        with pytest.raises(RuntimeError, match="refusing screenshot"):
+            helpers.capture_screenshot(str(tmp_path / "shot.png"))
+    cdp.assert_not_called()
+    assert not (tmp_path / "shot.png").exists()
+
+
+def test_screenshot_proceeds_when_the_password_check_cannot_run(fake_png, tmp_path):
+    with patch("browser_harness.helpers.js", side_effect=RuntimeError("no page")), patch(
+        "browser_harness.helpers.cdp", return_value={"data": fake_png(10, 10)}
+    ):
+        helpers.capture_screenshot(str(tmp_path / "shot.png"))
+    assert (tmp_path / "shot.png").exists()
+
+
+def _run_password_js(inputs):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    stub = (
+        "const inputs = " + json.dumps(inputs) + ".map(i => ({...i, getAttribute: k => i[k] ?? null}));"
+        "globalThis.document = {querySelectorAll: () => inputs};"
+        "console.log(JSON.stringify(" + helpers._VISIBLE_PASSWORD_JS + "));"
+    )
+    return json.loads(subprocess.run([node, "-e", stub], capture_output=True, text=True, check=True).stdout)
+
+
+def test_visible_password_js_flags_a_shown_password_only():
+    shown = {"type": "text", "name": "Passwd", "id": "", "autocomplete": "", "value": "x"}
+    assert _run_password_js([shown]) is True
+    assert _run_password_js([{**shown, "type": "password"}]) is False  # dots: safe
+    assert _run_password_js([{**shown, "value": ""}]) is False  # empty field
+    assert _run_password_js([{**shown, "name": "email"}]) is False
+    assert _run_password_js([{**shown, "name": "", "autocomplete": "current-password"}]) is True
