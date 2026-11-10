@@ -980,9 +980,9 @@ def test_js_keeps_base_exception_from_evaluation_when_detach_also_raises():
         helpers.js("7", target_id="iframe-target")
 
 
-def test_screenshot_refuses_when_a_password_is_visible(tmp_path):
+def test_screenshot_refuses_when_a_password_is_visible(fake_png, tmp_path):
     with patch("browser_harness.helpers.js", return_value=True), patch(
-        "browser_harness.helpers.cdp"
+        "browser_harness.helpers.cdp", return_value={"data": fake_png(10, 10)}
     ) as cdp:
         with pytest.raises(RuntimeError, match="refusing screenshot"):
             helpers.capture_screenshot(str(tmp_path / "shot.png"))
@@ -1017,3 +1017,10 @@ def test_visible_password_js_flags_a_shown_password_only():
     assert _run_password_js([{**shown, "value": ""}]) is False  # empty field
     assert _run_password_js([{**shown, "name": "email"}]) is False
     assert _run_password_js([{**shown, "name": "", "autocomplete": "current-password"}]) is True
+    for name in ("pass", "pwd", "Passwort"):
+        assert _run_password_js([{**shown, "name": name}]) is True, name
+    assert _run_password_js([{**shown, "name": "", "placeholder": "Password"}]) is True
+    # Not a shown password: a checkbox (value "on"), hidden token, submit button.
+    for kind, name in (("checkbox", "show-password"), ("hidden", "password_reset_token"), ("submit", "password")):
+        assert _run_password_js([{**shown, "type": kind, "name": name}]) is False, kind
+    assert _run_password_js([{**shown, "name": "passport"}]) is False

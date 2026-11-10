@@ -581,10 +581,11 @@ def scroll(x, y, dy=-300, dx=0):
 # agent transcripts. Fields still typed "password" render as dots and are safe.
 _VISIBLE_PASSWORD_JS = """(() => {
   for (const el of document.querySelectorAll('input')) {
-    if (el.type === 'password' || !el.value) continue;
-    const hint = [el.name, el.id, el.autocomplete, el.getAttribute('aria-label') || '']
-      .join(' ').toLowerCase();
-    if (/passw(or)?d|current-password|new-password/.test(hint)) return true;
+    // Only text-like inputs can show a typed value; a checkbox's value is "on".
+    if (!['text', 'search', 'email', 'tel', 'url', ''].includes(el.type) || !el.value) continue;
+    const hint = [el.name, el.id, el.autocomplete, el.placeholder,
+      el.getAttribute('aria-label') || ''].join(' ').toLowerCase();
+    if (/passw(or)?d|passwort|\\bpass\\b|\\bpwd\\b|current-password|new-password/.test(hint)) return true;
   }
   return false;
 })()"""
@@ -595,7 +596,7 @@ def _visible_password_on_page():
     where the check cannot run does not block the screenshot."""
     try:
         return js(_VISIBLE_PASSWORD_JS) is True
-    except BaseException:
+    except Exception:
         return False
 
 
