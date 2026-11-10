@@ -356,8 +356,9 @@ def test_implicit_fallback_owner_frees_once_owner_and_call_are_gone():
     assert lease.acquire("t1", holder="next", wait=0)["holder"] == "next"
 
 
-def test_expired_lease_is_not_taken_while_its_call_is_still_running():
+def test_expired_lease_is_not_taken_while_its_call_is_still_running(monkeypatch):
     """A single long call never renews its own heartbeat."""
+    monkeypatch.setattr(lease, "_proc_start", lambda _pid: 0.0)  # the call began before its record
     lease._write("t1", {"holder": "alice", "pid": os.getpid(), "owner_src": "env", "explicit": False,
                         "invocation_pid": os.getpid(), "host": lease._hostname(),
                         "acquired_at": time.time() - 900, "heartbeat_at": time.time() - 900,
@@ -530,3 +531,32 @@ def test_zero_max_hold_means_no_limit():
     lease._write("t1", _held_since(100000, _find_dead_pid(), max_hold=0))
     with pytest.raises(lease.LeaseBusy):
         lease.acquire("t1", holder="bob", wait=0.1)
+
+
+# --- pid reuse (2026-11-10: a dead call's pid went to cloudtelemetryd) -------
+
+def _expired_record(invocation_pid):
+    now = time.time()
+    return {"holder": "pgrp:1", "pid": _find_dead_pid(), "owner_src": "fallback", "explicit": False,
+            "invocation_pid": invocation_pid, "host": lease._hostname(),
+            "acquired_at": now - 5000, "heartbeat_at": now - 5000, "expires_at": now - 4700}
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="start-time check is macOS only")
+def test_expired_lease_whose_call_pid_was_reused_is_taken_over():
+    """os.getpid() is alive but started long after the record was written."""
+    lease._write("t1", _expired_record(os.getpid()))
+    assert lease.acquire("t1", holder="bob", wait=0)["holder"] == "bob"
+
+
+def test_unreadable_start_time_keeps_the_conservative_answer(monkeypatch):
+    monkeypatch.setattr(lease, "_proc_start", lambda _pid: None)
+    lease._write("t1", _expired_record(os.getpid()))
+    with pytest.raises(lease.LeaseBusy):
+        lease.acquire("t1", holder="bob", wait=0.1)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="start-time check is macOS only")
+def test_proc_start_reads_this_process():
+    started = lease._proc_start(os.getpid())
+    assert started is not None and started <= time.time() + 1

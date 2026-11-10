@@ -62,6 +62,8 @@ on its own (rename is atomic for the WRITE, not for the preceding read+decide).
 import json
 import os
 import socket
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -241,7 +243,34 @@ def _is_dead(record):
 def _invocation_alive(record):
     ipid = record.get("invocation_pid")
     return (record.get("host") == _hostname() and isinstance(ipid, int) and ipid > 0
-            and _pid_alive(ipid))
+            and _pid_alive(ipid) and not _pid_reused(ipid, record))
+
+
+def _proc_start(pid):
+    """Start time (epoch seconds, whole-second resolution) of a live pid, or
+    None when it cannot be read. macOS only: its lstart is the wall time at
+    fork and never moves; procps derives lstart from btime, which a clock step
+    shifts, so on Linux a still-running call could read as reused (review of
+    PR #12). Elsewhere -> None, the conservative answer."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=5, env={**os.environ, "LC_ALL": "C"}).stdout
+        return time.mktime(time.strptime(" ".join(out.split()), "%a %b %d %H:%M:%S %Y"))
+    except Exception:
+        return None
+
+
+def _pid_reused(pid, record):
+    """The call that wrote the record was running at heartbeat_at, so a live
+    process with its pid that STARTED later is a different process (2026-11-10:
+    a dead call's pid went to macOS cloudtelemetryd and the lease blocked every
+    waiter 80 min past its expiry). Unreadable start time -> not reused (the
+    old, conservative answer)."""
+    started = _proc_start(pid)
+    written = record.get("heartbeat_at") or record.get("acquired_at")
+    return started is not None and isinstance(written, (int, float)) and started > written + 1
 
 
 def _expired(record, now):
