@@ -63,6 +63,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -247,8 +248,11 @@ def _invocation_alive(record):
 
 def _proc_start(pid):
     """Start time (epoch seconds, whole-second resolution) of a live pid, or
-    None when it cannot be read (Windows, ps missing, odd output)."""
-    if ipc.IS_WINDOWS:
+    None when it cannot be read. macOS only: its lstart is the wall time at
+    fork and never moves; procps derives lstart from btime, which a clock step
+    shifts, so on Linux a still-running call could read as reused (review of
+    PR #12). Elsewhere -> None, the conservative answer."""
+    if sys.platform != "darwin":
         return None
     try:
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,

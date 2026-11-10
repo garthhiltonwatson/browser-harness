@@ -542,6 +542,7 @@ def _expired_record(invocation_pid):
             "acquired_at": now - 5000, "heartbeat_at": now - 5000, "expires_at": now - 4700}
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="start-time check is macOS only")
 def test_expired_lease_whose_call_pid_was_reused_is_taken_over():
     """os.getpid() is alive but started long after the record was written."""
     lease._write("t1", _expired_record(os.getpid()))
@@ -555,6 +556,7 @@ def test_unreadable_start_time_keeps_the_conservative_answer(monkeypatch):
         lease.acquire("t1", holder="bob", wait=0.1)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="start-time check is macOS only")
 def test_proc_start_reads_this_process():
     started = lease._proc_start(os.getpid())
     assert started is not None and started <= time.time() + 1
