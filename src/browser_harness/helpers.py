@@ -3,7 +3,7 @@
 Core helpers live here. Agent-editable helpers live in
 BH_AGENT_WORKSPACE/agent_helpers.py.
 """
-import base64, importlib.util, json, math, os, sys, time, urllib.request
+import base64, importlib.util, json, math, os, re, sys, time, urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -306,12 +306,97 @@ def _tab_guard_check(method, params, session_id=None):
     _refuse(method, target_id, url, reason)
 
 
+# --- X write guard (always on) ---
+# Garth (CEO) 2026-11-15: "please don't post on x through browser automation
+# anymore. we are gonna get flagged". No write on x.com / twitter.com through
+# this harness: no post, reply, like, repost, follow, DM, bookmark change or
+# profile edit. Reading is allowed: navigation, scroll, hover and js() reads.
+#
+# Input on an X tab is refused. BH_X_READ_ONLY_HARVEST=1 (set only by the
+# bookmarks harvest runners) also allows clicks, js() clicks and navigation
+# keys, which the harvest needs to switch accounts and open folders; it never
+# allows typed text, a file upload or a js() touch on an X action button.
+# Fail closed: when the attached tab's URL cannot be read, a write is refused.
+
+class XWriteRefused(RuntimeError):
+    """A browser write on x.com / twitter.com (banned 2026-11-15)."""
+
+
+_X_HOST = re.compile(r"^https?://([a-z0-9-]+\.)*(x|twitter)\.com(?=[:/?#]|$)", re.I)
+_X_READ_MOUSE = {"mouseMoved", "mouseWheel"}
+_X_NAV_KEYS = {"Escape", "PageDown", "PageUp", "ArrowDown", "ArrowUp", "Home", "End"}
+_X_INPUT_METHODS = {
+    "Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.insertText",
+    "Input.dispatchTouchEvent", "Input.dispatchDragEvent", "Input.imeSetComposition",
+    "Input.synthesizeTapGesture", "Input.emulateTouchFromMouseEvent", "DOM.setFileInputFiles",
+}
+# js() that can change the page: a click, a synthetic event, a form submit,
+# an edit, or a write request.
+_X_JS_WRITE = re.compile(
+    r"\.click\s*\(|dispatchEvent|\.submit\s*\(|requestSubmit|execCommand|insertText"
+    r"|\.(value|textContent|innerText|innerHTML)\s*=[^=]|method\s*:\s*['\"`](post|put|patch|delete)",
+    re.I,
+)
+# Never, even for the harvest: an X action button or a write endpoint.
+_X_JS_ACTION = re.compile(
+    r"tweetButton|tweetTextarea|(\"|'|=)(un)?(like|retweet|reply|bookmark|removeBookmark|follow|unfollow"
+    r"|block|unblock|confirmationSheetConfirm|dmComposerSendButton|sendDMFromProfile|userActions)\b"
+    r"|CreateTweet|DeleteTweet|FavoriteTweet|UnfavoriteTweet|CreateRetweet|DeleteRetweet|CreateBookmark"
+    r"|DeleteBookmark|friendships/(create|destroy)|dm/new",
+    re.I,
+)
+
+
+def _x_write_kind(method, params):
+    """None for a read; else a short name of the write. Pure: no I/O."""
+    harvest = os.environ.get("BH_X_READ_ONLY_HARVEST") == "1"
+    if method == "Runtime.evaluate":
+        expr = str(params.get("expression", ""))
+        if _X_JS_ACTION.search(expr):
+            return "js on an X action"
+        if _X_JS_WRITE.search(expr) and not harvest:
+            return "js write"
+        return None
+    if method not in _X_INPUT_METHODS:
+        return None
+    if method == "Input.dispatchMouseEvent":
+        if params.get("type") in _X_READ_MOUSE or harvest:
+            return None
+        return "click"
+    if method == "Input.dispatchKeyEvent":
+        if harvest and params.get("key") in _X_NAV_KEYS and not params.get("text") and not params.get("modifiers"):
+            return None
+        return "key"
+    return method.split(".", 1)[1]
+
+
+def _x_write_check(method, params):
+    kind = _x_write_kind(method, params)
+    if kind is None:
+        return
+    try:
+        url = _send({"meta": "current_tab"}).get("url")
+    except Exception:
+        url = None
+    if url is None:
+        reason = "could not read the attached tab's URL (failing closed)"
+    elif _X_HOST.match(url):
+        reason = "no X writes by browser automation (Garth 2026-11-15)"
+    else:
+        return
+    line = f"[x-guard] REFUSED {kind} ({method}) on {url or '?'}: {reason}"
+    print(line, file=sys.stderr, flush=True)
+    raise XWriteRefused(line)
+
+
 def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS, **params):
     """Raw CDP. cdp('Page.navigate', url='...'), cdp('DOM.getDocument', depth=-1).
 
     Under BH_TAB_GUARD=1, a call against a tab this run did not open raises
-    TabGuardRefused — see the tab guard block above."""
+    TabGuardRefused — see the tab guard block above. A write on an x.com or
+    twitter.com tab raises XWriteRefused — see the X write guard above."""
     _tab_guard_check(method, params, session_id)
+    _x_write_check(method, params)
     result = _send(
         {"method": method, "params": params, "session_id": session_id},
         response_timeout=_response_timeout,
