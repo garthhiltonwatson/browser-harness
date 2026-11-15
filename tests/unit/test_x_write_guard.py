@@ -4,14 +4,24 @@ import pytest
 from browser_harness import helpers
 
 
-def _send_at(url, calls=None):
+def _send_at(url, calls=None, point="", session_url=None):
     def send(req, response_timeout=None):
         if calls is not None:
             calls.append(req)
         if req.get("meta") == "current_tab":
             return {"targetId": "T", "url": url, "title": ""} if url is not None else {"error": "not_attached"}
+        expr = (req.get("params") or {}).get("expression", "")
+        if expr == "location.href":
+            return {"result": {"result": {"value": session_url}}}
+        if "elementFromPoint" in expr:
+            return {"result": {"result": {"value": point}}}
         return {"result": {}}
     return send
+
+
+def _writes(calls):
+    return [c for c in calls if c.get("method", "").startswith(("Input.", "DOM.set"))
+            or (c.get("method") == "Runtime.evaluate" and "click" in c["params"].get("expression", ""))]
 
 
 @pytest.fixture(autouse=True)
@@ -39,7 +49,7 @@ def test_every_write_on_x_is_refused(monkeypatch, url, act):
     monkeypatch.setattr(helpers, "_send", _send_at(url, calls))
     with pytest.raises(helpers.XWriteRefused):
         act()
-    assert not any(c.get("method", "").startswith(("Input.", "DOM.setFile", "Runtime.")) for c in calls)
+    assert not _writes(calls)
 
 
 @pytest.mark.parametrize("act", [
@@ -85,8 +95,58 @@ def test_other_sites_are_untouched(monkeypatch, url):
 
 
 def test_unreadable_url_fails_closed_for_writes_only(monkeypatch):
-    monkeypatch.setattr(helpers, "_send", _send_at(None))
-    with pytest.raises(helpers.XWriteRefused):
+    calls = []
+    monkeypatch.setattr(helpers, "_send", _send_at(None, calls))
+    with pytest.raises(helpers.XGuardUnavailable, match="not_attached"):
         helpers.click_at_xy(10, 10)
+    assert sum(c.get("meta") == "current_tab" for c in calls) == 2  # one retry before refusing
     helpers.scroll(10, 10)
     helpers.js("document.title")
+
+
+@pytest.mark.parametrize("act", [
+    lambda: helpers.cdp("Runtime.callFunctionOn", functionDeclaration="function(){this.click()}", objectId="1"),
+    lambda: helpers.cdp("Page.addScriptToEvaluateOnNewDocument", source="document.body.click()"),
+    lambda: helpers.cdp("Page.navigate", url="javascript:document.forms[0].submit()"),
+    lambda: helpers.cdp("DOM.setOuterHTML", nodeId=1, outerHTML="<p>"),
+    lambda: helpers.cdp("Input.insertText", text="hi"),
+    lambda: helpers.js("navigator.sendBeacon('/i/api/1.1/x', 'a')"),
+    lambda: helpers.js("const r=new XMLHttpRequest();r.open('POST','/i/api/x');r.send()"),
+    lambda: helpers.js("fetch('/i/api/graphql/q/CreateNoteTweet', {})"),
+    lambda: helpers.cdp("Input.dispatchKeyEvent", type="keyDown", key="ArrowDown", commands=["selectAll"]),
+])
+def test_other_write_routes_on_x_are_refused_even_for_the_harvest(monkeypatch, act):
+    monkeypatch.setenv("BH_X_READ_ONLY_HARVEST", "1")
+    monkeypatch.setattr(helpers, "_send", _send_at("https://x.com/home"))
+    with pytest.raises(helpers.XWriteRefused):
+        act()
+
+
+def test_explicit_session_is_checked_by_its_own_url(monkeypatch):
+    # The attached tab is elsewhere, but the addressed session is on X.
+    monkeypatch.setattr(helpers, "_send", _send_at("https://example.com/", session_url="https://x.com/home"))
+    with pytest.raises(helpers.XWriteRefused):
+        helpers.cdp("Input.insertText", session_id="S1", text="hi")
+    monkeypatch.setattr(helpers, "_send", _send_at("https://x.com/home", session_url="https://example.com/"))
+    helpers.cdp("Input.insertText", session_id="S1", text="hi")
+
+
+@pytest.mark.parametrize("point", ["like|Like", "retweet|Repost", "reply|Reply", "|Follow @someone", "tweetButtonInline|Post"])
+def test_harvest_click_on_an_action_button_is_refused(monkeypatch, point):
+    monkeypatch.setenv("BH_X_READ_ONLY_HARVEST", "1")
+    calls = []
+    monkeypatch.setattr(helpers, "_send", _send_at("https://x.com/i/bookmarks", calls, point=point))
+    with pytest.raises(helpers.XWriteRefused):
+        helpers.click_at_xy(10, 10)
+    assert not _writes(calls)
+
+
+def test_harvest_flag_in_env_file_is_ignored(monkeypatch, tmp_path):
+    p = tmp_path / ".env"
+    p.write_text("BH_X_READ_ONLY_HARVEST=1\nBH_SOME_OTHER=1\n")
+    monkeypatch.delenv("BH_SOME_OTHER", raising=False)
+    helpers._load_env_file(p)
+    import os
+    assert os.environ.get("BH_X_READ_ONLY_HARVEST") is None
+    assert os.environ.get("BH_SOME_OTHER") == "1"
+    monkeypatch.delenv("BH_SOME_OTHER", raising=False)

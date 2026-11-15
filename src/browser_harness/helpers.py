@@ -30,6 +30,8 @@ def _load_env_file(p):
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
+        if k.strip() == "BH_X_READ_ONLY_HARVEST":
+            continue  # the X harvest allowance comes only from the runner that calls us, never a .env file
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
@@ -322,28 +324,46 @@ class XWriteRefused(RuntimeError):
     """A browser write on x.com / twitter.com (banned 2026-11-15)."""
 
 
+class XGuardUnavailable(XWriteRefused):
+    """The X guard could not read the URL a write would act on, so it refused the
+    write (fail closed). The message keeps the original error text, so a daemon
+    timeout on any site stays visible as a timeout."""
+
+
 _X_HOST = re.compile(r"^https?://([a-z0-9-]+\.)*(x|twitter)\.com(?=[:/?#]|$)", re.I)
 _X_READ_MOUSE = {"mouseMoved", "mouseWheel"}
 _X_NAV_KEYS = {"Escape", "PageDown", "PageUp", "ArrowDown", "ArrowUp", "Home", "End"}
-_X_INPUT_METHODS = {
-    "Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.insertText",
-    "Input.dispatchTouchEvent", "Input.dispatchDragEvent", "Input.imeSetComposition",
-    "Input.synthesizeTapGesture", "Input.emulateTouchFromMouseEvent", "DOM.setFileInputFiles",
-}
+# Method families that can change an X page other than through Runtime.evaluate.
+_X_WRITE_METHOD = re.compile(
+    r"^(Input\.|DOM\.(set|remove|insert|move|undo|redo|copyTo|focus)|Runtime\.(callFunctionOn|compileScript|runScript)"
+    r"|Page\.(addScriptToEvaluateOnNewDocument|setDocumentContent)|Debugger\.|Fetch\.)"
+)
 # js() that can change the page: a click, a synthetic event, a form submit,
 # an edit, or a write request.
 _X_JS_WRITE = re.compile(
     r"\.click\s*\(|dispatchEvent|\.submit\s*\(|requestSubmit|execCommand|insertText"
-    r"|\.(value|textContent|innerText|innerHTML)\s*=[^=]|method\s*:\s*['\"`](post|put|patch|delete)",
+    r"|\.(value|textContent|innerText|innerHTML)\s*=[^=]",
     re.I,
 )
-# Never, even for the harvest: an X action button or a write endpoint.
+# Never, even for the harvest: a write request, an X action button or a write endpoint.
 _X_JS_ACTION = re.compile(
-    r"tweetButton|tweetTextarea|(\"|'|=)(un)?(like|retweet|reply|bookmark|removeBookmark|follow|unfollow"
+    r"sendBeacon|method\s*:\s*['\"`](post|put|patch|delete)|\.open\s*\(\s*['\"`](post|put|patch|delete)"
+    r"|tweetButton|tweetTextarea|(\"|'|=)(un)?(like|retweet|repost|reply|bookmark|removeBookmark|follow|unfollow"
     r"|block|unblock|confirmationSheetConfirm|dmComposerSendButton|sendDMFromProfile|userActions)\b"
-    r"|CreateTweet|DeleteTweet|FavoriteTweet|UnfavoriteTweet|CreateRetweet|DeleteRetweet|CreateBookmark"
+    r"|Create\w*Tweet|DeleteTweet|FavoriteTweet|UnfavoriteTweet|CreateRetweet|DeleteRetweet|CreateBookmark"
     r"|DeleteBookmark|friendships/(create|destroy)|dm/new",
     re.I,
+)
+# A harvest click is checked against the element under the point.
+_X_POINT_JS = (
+    "(()=>{const e=document.elementFromPoint(%r,%r);if(!e)return '';"
+    "const b=e.closest('[data-testid],[role=button],button,a');"
+    "return b?((b.getAttribute('data-testid')||'')+'|'+(b.getAttribute('aria-label')||'')):''})()"
+)
+_X_ACTION_TARGET = re.compile(
+    r"^(un)?(like|retweet|reply|bookmark|removeBookmark|follow|unfollow|block|unblock|confirmationSheetConfirm"
+    r"|userActions|caret)\b|^tweetButton|^tweetTextarea|^dmComposer|^sendDMFromProfile"
+    r"|\|.*\b(Like|Liked|Repost|Reposted|Reply|Bookmark|Follow|Following|Post|Delete|Block)\b"
 )
 
 
@@ -357,36 +377,81 @@ def _x_write_kind(method, params):
         if _X_JS_WRITE.search(expr) and not harvest:
             return "js write"
         return None
-    if method not in _X_INPUT_METHODS:
+    if method == "Page.navigate":
+        return "javascript: URL" if str(params.get("url", "")).strip().lower().startswith("javascript:") else None
+    if not _X_WRITE_METHOD.match(method):
         return None
     if method == "Input.dispatchMouseEvent":
-        if params.get("type") in _X_READ_MOUSE or harvest:
+        if params.get("type") in _X_READ_MOUSE:
             return None
-        return "click"
+        return "harvest click" if harvest else "click"
     if method == "Input.dispatchKeyEvent":
-        if harvest and params.get("key") in _X_NAV_KEYS and not params.get("text") and not params.get("modifiers"):
+        if (harvest and params.get("key") in _X_NAV_KEYS and not params.get("text")
+                and not params.get("modifiers") and not params.get("commands")):
             return None
         return "key"
     return method.split(".", 1)[1]
 
 
-def _x_write_check(method, params):
+def _x_eval(expr, session_id):
+    r = _send({"method": "Runtime.evaluate", "params": {"expression": expr, "returnByValue": True},
+               "session_id": session_id})
+    return ((r.get("result") or {}).get("result") or {}).get("value")
+
+
+def _x_target_url(session_id):
+    """The URL a call would act on: the page of an explicitly addressed session,
+    else the daemon's attached tab. Tries twice; raises the last error."""
+    last = None
+    for _ in range(2):
+        try:
+            if session_id is not None:
+                url, err = _x_eval("location.href", session_id), None
+            else:
+                r = _send({"meta": "current_tab"})
+                url, err = r.get("url"), r.get("error")
+            if isinstance(url, str) and url:
+                return url
+            last = RuntimeError(err or "no url in the reply")
+        except Exception as e:  # noqa: BLE001 - re-raised as XGuardUnavailable
+            last = e
+    raise last
+
+
+def _x_refuse(cls, kind, method, url, reason):
+    line = f"[x-guard] REFUSED {kind} ({method}) on {url or '?'}: {reason}"
+    print(line, file=sys.stderr, flush=True)
+    log_path = os.environ.get("BH_X_GUARD_LOG")
+    if log_path:
+        try:
+            with open(log_path, "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {line}\n")
+        except Exception:
+            pass  # the stderr line and the raise still stand
+    raise cls(line)
+
+
+def _x_write_check(method, params, session_id=None):
     kind = _x_write_kind(method, params)
     if kind is None:
         return
     try:
-        url = _send({"meta": "current_tab"}).get("url")
-    except Exception:
-        url = None
-    if url is None:
-        reason = "could not read the attached tab's URL (failing closed)"
-    elif _X_HOST.match(url):
-        reason = "no X writes by browser automation (Garth 2026-11-15)"
-    else:
+        url = _x_target_url(session_id)
+    except Exception as e:  # noqa: BLE001
+        _x_refuse(XGuardUnavailable, kind, method, None,
+                  f"could not read the URL, failing closed ({type(e).__name__}: {e})")
+    if not _X_HOST.match(url):
         return
-    line = f"[x-guard] REFUSED {kind} ({method}) on {url or '?'}: {reason}"
-    print(line, file=sys.stderr, flush=True)
-    raise XWriteRefused(line)
+    if kind == "harvest click":
+        # The harvest may click menus, folders and the account switcher, never an X action.
+        try:
+            target = str(_x_eval(_X_POINT_JS % (float(params.get("x", -1)), float(params.get("y", -1))), session_id) or "")
+        except Exception as e:  # noqa: BLE001
+            _x_refuse(XGuardUnavailable, kind, method, url, f"could not read the click target, failing closed ({e})")
+        if not _X_ACTION_TARGET.search(target):
+            return
+        kind = f"click on {target[:60]!r}"
+    _x_refuse(XWriteRefused, kind, method, url, "no X writes by browser automation (Garth 2026-11-15)")
 
 
 def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS, **params):
@@ -396,7 +461,7 @@ def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_
     TabGuardRefused — see the tab guard block above. A write on an x.com or
     twitter.com tab raises XWriteRefused — see the X write guard above."""
     _tab_guard_check(method, params, session_id)
-    _x_write_check(method, params)
+    _x_write_check(method, params, session_id)
     result = _send(
         {"method": method, "params": params, "session_id": session_id},
         response_timeout=_response_timeout,
